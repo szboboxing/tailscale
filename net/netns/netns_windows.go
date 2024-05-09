@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package netns
 
@@ -9,11 +8,11 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/sys/cpu"
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
-	"tailscale.com/util/endian"
 )
 
 func interfaceIndex(iface *winipcfg.IPAdapterAddresses) uint32 {
@@ -27,7 +26,7 @@ func interfaceIndex(iface *winipcfg.IPAdapterAddresses) uint32 {
 	return iface.IfIndex
 }
 
-func control(logger.Logf) func(network, address string, c syscall.RawConn) error {
+func control(logger.Logf, *netmon.Monitor) func(network, address string, c syscall.RawConn) error {
 	return controlC
 }
 
@@ -52,7 +51,7 @@ func controlC(network, address string, c syscall.RawConn) error {
 	}
 
 	if canV4 {
-		iface, err := interfaces.GetWindowsDefault(windows.AF_INET)
+		iface, err := netmon.GetWindowsDefault(windows.AF_INET)
 		if err != nil {
 			return err
 		}
@@ -62,7 +61,7 @@ func controlC(network, address string, c syscall.RawConn) error {
 	}
 
 	if canV6 {
-		iface, err := interfaces.GetWindowsDefault(windows.AF_INET6)
+		iface, err := netmon.GetWindowsDefault(windows.AF_INET6)
 		if err != nil {
 			return err
 		}
@@ -119,7 +118,7 @@ func bindSocket6(c syscall.RawConn, ifidx uint32) error {
 // representation, suitable for passing to Windows APIs that require a
 // mangled uint32.
 func nativeToBigEndian(i uint32) uint32 {
-	if endian.Big {
+	if cpu.IsBigEndian {
 		return i
 	}
 	return bits.ReverseBytes32(i)

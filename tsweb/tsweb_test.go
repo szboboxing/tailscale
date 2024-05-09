@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tsweb
 
@@ -8,21 +7,19 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"expvar"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"tailscale.com/metrics"
 	"tailscale.com/tstest"
-	"tailscale.com/version"
+	"tailscale.com/util/must"
+	"tailscale.com/util/vizerror"
 )
 
 type noopHijacker struct {
@@ -43,6 +40,7 @@ func (f handlerFunc) ServeHTTPReturn(w http.ResponseWriter, r *http.Request) err
 }
 
 func TestStdHandler(t *testing.T) {
+	const exampleRequestID = "example-request-id"
 	var (
 		handlerCode = func(code int) ReturnHandler {
 			return handlerFunc(func(w http.ResponseWriter, r *http.Request) error {
@@ -70,10 +68,7 @@ func TestStdHandler(t *testing.T) {
 		testErr = errors.New("test error")
 		bgCtx   = context.Background()
 		// canceledCtx, cancel = context.WithCancel(bgCtx)
-		clock = tstest.Clock{
-			Start: time.Now(),
-			Step:  time.Second,
-		}
+		startTime = time.Unix(1687870000, 1234)
 	)
 	// cancel()
 
@@ -84,6 +79,7 @@ func TestStdHandler(t *testing.T) {
 		errHandler ErrorHandlerFunc
 		wantCode   int
 		wantLog    AccessLogRecord
+		wantBody   string
 	}{
 		{
 			name:     "handler returns 200",
@@ -91,7 +87,24 @@ func TestStdHandler(t *testing.T) {
 			r:        req(bgCtx, "http://example.com/"),
 			wantCode: 200,
 			wantLog: AccessLogRecord{
-				When:       clock.Start,
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				TLS:        false,
+				Host:       "example.com",
+				Method:     "GET",
+				Code:       200,
+				RequestURI: "/",
+			},
+		},
+
+		{
+			name:     "handler returns 200 with request ID",
+			rh:       handlerCode(200),
+			r:        req(bgCtx, "http://example.com/"),
+			wantCode: 200,
+			wantLog: AccessLogRecord{
+				When:       startTime,
 				Seconds:    1.0,
 				Proto:      "HTTP/1.1",
 				TLS:        false,
@@ -108,7 +121,23 @@ func TestStdHandler(t *testing.T) {
 			r:        req(bgCtx, "http://example.com/foo"),
 			wantCode: 404,
 			wantLog: AccessLogRecord{
-				When:       clock.Start,
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Code:       404,
+			},
+		},
+
+		{
+			name:     "handler returns 404 with request ID",
+			rh:       handlerCode(404),
+			r:        req(bgCtx, "http://example.com/foo"),
+			wantCode: 404,
+			wantLog: AccessLogRecord{
+				When:       startTime,
 				Seconds:    1.0,
 				Proto:      "HTTP/1.1",
 				Host:       "example.com",
@@ -124,7 +153,7 @@ func TestStdHandler(t *testing.T) {
 			r:        req(bgCtx, "http://example.com/foo"),
 			wantCode: 404,
 			wantLog: AccessLogRecord{
-				When:       clock.Start,
+				When:       startTime,
 				Seconds:    1.0,
 				Proto:      "HTTP/1.1",
 				Host:       "example.com",
@@ -133,6 +162,26 @@ func TestStdHandler(t *testing.T) {
 				Err:        "not found: " + testErr.Error(),
 				Code:       404,
 			},
+			wantBody: "not found\n",
+		},
+
+		{
+			name:     "handler returns 404 via HTTPError with request ID",
+			rh:       handlerErr(0, Error(404, "not found", testErr)),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
+			wantCode: 404,
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        "not found: " + testErr.Error(),
+				Code:       404,
+				RequestID:  exampleRequestID,
+			},
+			wantBody: "not found\n" + exampleRequestID + "\n",
 		},
 
 		{
@@ -141,7 +190,7 @@ func TestStdHandler(t *testing.T) {
 			r:        req(bgCtx, "http://example.com/foo"),
 			wantCode: 404,
 			wantLog: AccessLogRecord{
-				When:       clock.Start,
+				When:       startTime,
 				Seconds:    1.0,
 				Proto:      "HTTP/1.1",
 				Host:       "example.com",
@@ -150,6 +199,100 @@ func TestStdHandler(t *testing.T) {
 				Err:        "not found",
 				Code:       404,
 			},
+			wantBody: "not found\n",
+		},
+
+		{
+			name:     "handler returns 404 with request ID and nil child error",
+			rh:       handlerErr(0, Error(404, "not found", nil)),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
+			wantCode: 404,
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        "not found",
+				Code:       404,
+				RequestID:  exampleRequestID,
+			},
+			wantBody: "not found\n" + exampleRequestID + "\n",
+		},
+
+		{
+			name:     "handler returns user-visible error",
+			rh:       handlerErr(0, vizerror.New("visible error")),
+			r:        req(bgCtx, "http://example.com/foo"),
+			wantCode: 500,
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        "visible error",
+				Code:       500,
+			},
+			wantBody: "visible error\n",
+		},
+
+		{
+			name:     "handler returns user-visible error with request ID",
+			rh:       handlerErr(0, vizerror.New("visible error")),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
+			wantCode: 500,
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        "visible error",
+				Code:       500,
+				RequestID:  exampleRequestID,
+			},
+			wantBody: "visible error\n" + exampleRequestID + "\n",
+		},
+
+		{
+			name:     "handler returns user-visible error wrapped by private error",
+			rh:       handlerErr(0, fmt.Errorf("private internal error: %w", vizerror.New("visible error"))),
+			r:        req(bgCtx, "http://example.com/foo"),
+			wantCode: 500,
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        "visible error",
+				Code:       500,
+			},
+			wantBody: "visible error\n",
+		},
+
+		{
+			name:     "handler returns user-visible error wrapped by private error with request ID",
+			rh:       handlerErr(0, fmt.Errorf("private internal error: %w", vizerror.New("visible error"))),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
+			wantCode: 500,
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        "visible error",
+				Code:       500,
+				RequestID:  exampleRequestID,
+			},
+			wantBody: "visible error\n" + exampleRequestID + "\n",
 		},
 
 		{
@@ -158,7 +301,7 @@ func TestStdHandler(t *testing.T) {
 			r:        req(bgCtx, "http://example.com/foo"),
 			wantCode: 500,
 			wantLog: AccessLogRecord{
-				When:       clock.Start,
+				When:       startTime,
 				Seconds:    1.0,
 				Proto:      "HTTP/1.1",
 				Host:       "example.com",
@@ -167,6 +310,26 @@ func TestStdHandler(t *testing.T) {
 				Err:        testErr.Error(),
 				Code:       500,
 			},
+			wantBody: "internal server error\n",
+		},
+
+		{
+			name:     "handler returns generic error with request ID",
+			rh:       handlerErr(0, testErr),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
+			wantCode: 500,
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        testErr.Error(),
+				Code:       500,
+				RequestID:  exampleRequestID,
+			},
+			wantBody: "internal server error\n" + exampleRequestID + "\n",
 		},
 
 		{
@@ -175,7 +338,7 @@ func TestStdHandler(t *testing.T) {
 			r:        req(bgCtx, "http://example.com/foo"),
 			wantCode: 200,
 			wantLog: AccessLogRecord{
-				When:       clock.Start,
+				When:       startTime,
 				Seconds:    1.0,
 				Proto:      "HTTP/1.1",
 				Host:       "example.com",
@@ -187,12 +350,30 @@ func TestStdHandler(t *testing.T) {
 		},
 
 		{
+			name:     "handler returns error after writing response with request ID",
+			rh:       handlerErr(200, testErr),
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/foo"),
+			wantCode: 200,
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				Host:       "example.com",
+				Method:     "GET",
+				RequestURI: "/foo",
+				Err:        testErr.Error(),
+				Code:       200,
+				RequestID:  exampleRequestID,
+			},
+		},
+
+		{
 			name:     "handler returns HTTPError after writing response",
 			rh:       handlerErr(200, Error(404, "not found", testErr)),
 			r:        req(bgCtx, "http://example.com/foo"),
 			wantCode: 200,
 			wantLog: AccessLogRecord{
-				When:       clock.Start,
+				When:       startTime,
 				Seconds:    1.0,
 				Proto:      "HTTP/1.1",
 				Host:       "example.com",
@@ -209,7 +390,7 @@ func TestStdHandler(t *testing.T) {
 			r:        req(bgCtx, "http://example.com/foo"),
 			wantCode: 200,
 			wantLog: AccessLogRecord{
-				When:       clock.Start,
+				When:       startTime,
 				Seconds:    1.0,
 				Proto:      "HTTP/1.1",
 				Host:       "example.com",
@@ -231,7 +412,7 @@ func TestStdHandler(t *testing.T) {
 			r:        req(bgCtx, "http://example.com/foo"),
 			wantCode: 200,
 			wantLog: AccessLogRecord{
-				When:    clock.Start,
+				When:    startTime,
 				Seconds: 1.0,
 
 				Proto:      "HTTP/1.1",
@@ -241,6 +422,7 @@ func TestStdHandler(t *testing.T) {
 				Code:       101,
 			},
 		},
+
 		{
 			name:     "error handler gets run",
 			rh:       handlerErr(0, Error(404, "not found", nil)), // status code changed in errHandler
@@ -250,7 +432,7 @@ func TestStdHandler(t *testing.T) {
 				http.Error(w, e.Msg, 200)
 			},
 			wantLog: AccessLogRecord{
-				When:       clock.Start,
+				When:       startTime,
 				Seconds:    1.0,
 				Proto:      "HTTP/1.1",
 				TLS:        false,
@@ -260,6 +442,31 @@ func TestStdHandler(t *testing.T) {
 				Err:        "not found",
 				RequestURI: "/",
 			},
+			wantBody: "not found\n",
+		},
+
+		{
+			name:     "error handler gets run with request ID",
+			rh:       handlerErr(0, Error(404, "not found", nil)), // status code changed in errHandler
+			r:        req(RequestIDKey.WithValue(bgCtx, exampleRequestID), "http://example.com/"),
+			wantCode: 200,
+			errHandler: func(w http.ResponseWriter, r *http.Request, e HTTPError) {
+				requestID := RequestIDFromContext(r.Context())
+				http.Error(w, fmt.Sprintf("%s with request ID %s", e.Msg, requestID), 200)
+			},
+			wantLog: AccessLogRecord{
+				When:       startTime,
+				Seconds:    1.0,
+				Proto:      "HTTP/1.1",
+				TLS:        false,
+				Host:       "example.com",
+				Method:     "GET",
+				Code:       404,
+				Err:        "not found",
+				RequestURI: "/",
+				RequestID:  exampleRequestID,
+			},
+			wantBody: "not found with request ID " + exampleRequestID + "\n",
 		},
 	}
 
@@ -273,7 +480,10 @@ func TestStdHandler(t *testing.T) {
 				t.Logf(fmt, args...)
 			}
 
-			clock.Reset()
+			clock := tstest.NewClock(tstest.ClockOpts{
+				Start: startTime,
+				Step:  time.Second,
+			})
 
 			rec := noopHijacker{httptest.NewRecorder(), false}
 			h := StdHandler(test.rh, HandlerOptions{Logf: logf, Now: clock.Now, OnError: test.errHandler})
@@ -295,6 +505,9 @@ func TestStdHandler(t *testing.T) {
 			if diff := cmp.Diff(logs[0], test.wantLog, errTransform); diff != "" {
 				t.Errorf("handler wrote incorrect request log (-got+want):\n%s", diff)
 			}
+			if diff := cmp.Diff(rec.Body.String(), test.wantBody); diff != "" {
+				t.Errorf("handler wrote incorrect body (-got+want):\n%s", diff)
+			}
 		})
 	}
 }
@@ -308,7 +521,7 @@ func BenchmarkLogNot200(b *testing.B) {
 	h := StdHandler(rh, HandlerOptions{QuietLoggingIfSuccessful: true})
 	req := httptest.NewRequest("GET", "/", nil)
 	rw := new(httptest.ResponseRecorder)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		*rw = httptest.ResponseRecorder{}
 		h.ServeHTTP(rw, req)
 	}
@@ -323,7 +536,7 @@ func BenchmarkLog(b *testing.B) {
 	h := StdHandler(rh, HandlerOptions{})
 	req := httptest.NewRequest("GET", "/", nil)
 	rw := new(httptest.ResponseRecorder)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		*rw = httptest.ResponseRecorder{}
 		h.ServeHTTP(rw, req)
 	}
@@ -335,328 +548,6 @@ func TestHTTPError_Unwrap(t *testing.T) {
 	if got := errors.Unwrap(err); got != wrappedErr {
 		t.Errorf("HTTPError.Unwrap() = %v, want %v", got, wrappedErr)
 	}
-}
-
-func TestVarzHandler(t *testing.T) {
-	t.Run("globals_log", func(t *testing.T) {
-		rec := httptest.NewRecorder()
-		VarzHandler(rec, httptest.NewRequest("GET", "/", nil))
-		t.Logf("Got: %s", rec.Body.Bytes())
-	})
-
-	half := new(expvar.Float)
-	half.Set(0.5)
-
-	tests := []struct {
-		name string
-		k    string // key name
-		v    expvar.Var
-		want string
-	}{
-		{
-			"int",
-			"foo",
-			new(expvar.Int),
-			"# TYPE foo counter\nfoo 0\n",
-		},
-		{
-			"int_with_type_counter",
-			"counter_foo",
-			new(expvar.Int),
-			"# TYPE foo counter\nfoo 0\n",
-		},
-		{
-			"int_with_type_gauge",
-			"gauge_foo",
-			new(expvar.Int),
-			"# TYPE foo gauge\nfoo 0\n",
-		},
-		{
-			// For a float = 0.0, Prometheus client_golang outputs "0"
-			"float_zero",
-			"foo",
-			new(expvar.Float),
-			"# TYPE foo gauge\nfoo 0\n",
-		},
-		{
-			"float_point_5",
-			"foo",
-			half,
-			"# TYPE foo gauge\nfoo 0.5\n",
-		},
-		{
-			"float_with_type_counter",
-			"counter_foo",
-			half,
-			"# TYPE foo counter\nfoo 0.5\n",
-		},
-		{
-			"float_with_type_gauge",
-			"gauge_foo",
-			half,
-			"# TYPE foo gauge\nfoo 0.5\n",
-		},
-		{
-			"metrics_set",
-			"s",
-			&metrics.Set{
-				Map: *(func() *expvar.Map {
-					m := new(expvar.Map)
-					m.Init()
-					m.Add("foo", 1)
-					m.Add("bar", 2)
-					return m
-				})(),
-			},
-			"# TYPE s_bar counter\ns_bar 2\n# TYPE s_foo counter\ns_foo 1\n",
-		},
-		{
-			"metrics_set_TODO_gauge_type",
-			"gauge_s", // TODO(bradfitz): arguably a bug; should pass down type
-			&metrics.Set{
-				Map: *(func() *expvar.Map {
-					m := new(expvar.Map)
-					m.Init()
-					m.Add("foo", 1)
-					m.Add("bar", 2)
-					return m
-				})(),
-			},
-			"# TYPE s_bar counter\ns_bar 2\n# TYPE s_foo counter\ns_foo 1\n",
-		},
-		{
-			"expvar_map_untyped",
-			"api_status_code",
-			func() *expvar.Map {
-				m := new(expvar.Map)
-				m.Init()
-				m.Add("2xx", 100)
-				m.Add("5xx", 2)
-				return m
-			}(),
-			"api_status_code_2xx 100\napi_status_code_5xx 2\n",
-		},
-		{
-			"func_float64",
-			"counter_x",
-			expvar.Func(func() any { return float64(1.2) }),
-			"# TYPE x counter\nx 1.2\n",
-		},
-		{
-			"func_float64_gauge",
-			"gauge_x",
-			expvar.Func(func() any { return float64(1.2) }),
-			"# TYPE x gauge\nx 1.2\n",
-		},
-		{
-			"func_float64_untyped",
-			"x",
-			expvar.Func(func() any { return float64(1.2) }),
-			"x 1.2\n",
-		},
-		{
-			"metrics_label_map",
-			"counter_m",
-			&metrics.LabelMap{
-				Label: "label",
-				Map: *(func() *expvar.Map {
-					m := new(expvar.Map)
-					m.Init()
-					m.Add("foo", 1)
-					m.Add("bar", 2)
-					return m
-				})(),
-			},
-			"# TYPE m counter\nm{label=\"bar\"} 2\nm{label=\"foo\"} 1\n",
-		},
-		{
-			"metrics_label_map_untyped",
-			"control_save_config",
-			(func() *metrics.LabelMap {
-				m := &metrics.LabelMap{Label: "reason"}
-				m.Add("new", 1)
-				m.Add("updated", 1)
-				m.Add("fun", 1)
-				return m
-			})(),
-			"control_save_config{reason=\"fun\"} 1\ncontrol_save_config{reason=\"new\"} 1\ncontrol_save_config{reason=\"updated\"} 1\n",
-		},
-		{
-			"expvar_label_map",
-			"counter_labelmap_keyname_m",
-			func() *expvar.Map {
-				m := new(expvar.Map)
-				m.Init()
-				m.Add("foo", 1)
-				m.Add("bar", 2)
-				return m
-			}(),
-			"# TYPE m counter\nm{keyname=\"bar\"} 2\nm{keyname=\"foo\"} 1\n",
-		},
-		{
-			"struct_reflect",
-			"foo",
-			someExpVarWithJSONAndPromTypes(),
-			strings.TrimSpace(`
-# TYPE foo_AUint16 counter
-foo_AUint16 65535
-# TYPE foo_AnInt8 counter
-foo_AnInt8 127
-# TYPE foo_curTemp gauge
-foo_curTemp 20.6
-# TYPE foo_curX gauge
-foo_curX 3
-# TYPE foo_nestptr_bar counter
-foo_nestptr_bar 20
-# TYPE foo_nestptr_foo gauge
-foo_nestptr_foo 10
-# TYPE foo_nestvalue_bar counter
-foo_nestvalue_bar 2
-# TYPE foo_nestvalue_foo gauge
-foo_nestvalue_foo 1
-# TYPE foo_totalY counter
-foo_totalY 4
-`) + "\n",
-		},
-		{
-			"struct_reflect_nil_root",
-			"foo",
-			expvarAdapter{(*SomeStats)(nil)},
-			"",
-		},
-		{
-			"func_returning_int",
-			"num_goroutines",
-			expvar.Func(func() any { return 123 }),
-			"num_goroutines 123\n",
-		},
-		{
-			"var_that_exports_itself",
-			"custom_var",
-			promWriter{},
-			"custom_var_value 42\n",
-		},
-		{
-			"field_ordering",
-			"foo",
-			someExpVarWithFieldNamesSorting(),
-			strings.TrimSpace(`
-# TYPE foo_bar_a gauge
-foo_bar_a 1
-# TYPE foo_bar_b counter
-foo_bar_b 1
-# TYPE foo_foo_a gauge
-foo_foo_a 1
-# TYPE foo_foo_b counter
-foo_foo_b 1
-`) + "\n",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer func() { expvarDo = expvar.Do }()
-			expvarDo = func(f func(expvar.KeyValue)) {
-				f(expvar.KeyValue{Key: tt.k, Value: tt.v})
-			}
-			rec := httptest.NewRecorder()
-			VarzHandler(rec, httptest.NewRequest("GET", "/", nil))
-			if got := rec.Body.Bytes(); string(got) != tt.want {
-				t.Errorf("mismatch\n got: %q\n%s\nwant: %q\n%s\n", got, got, tt.want, tt.want)
-			}
-		})
-	}
-}
-
-type SomeNested struct {
-	FooG int64 `json:"foo" metrictype:"gauge"`
-	BarC int64 `json:"bar" metrictype:"counter"`
-	Omit int   `json:"-" metrictype:"counter"`
-}
-
-type SomeStats struct {
-	Nested       SomeNested  `json:"nestvalue"`
-	NestedPtr    *SomeNested `json:"nestptr"`
-	NestedNilPtr *SomeNested `json:"nestnilptr"`
-	CurX         int         `json:"curX" metrictype:"gauge"`
-	NoMetricType int         `json:"noMetric" metrictype:""`
-	TotalY       int64       `json:"totalY,omitempty" metrictype:"counter"`
-	CurTemp      float64     `json:"curTemp" metrictype:"gauge"`
-	AnInt8       int8        `metrictype:"counter"`
-	AUint16      uint16      `metrictype:"counter"`
-}
-
-// someExpVarWithJSONAndPromTypes returns an expvar.Var that
-// implements PrometheusMetricsReflectRooter for TestVarzHandler.
-func someExpVarWithJSONAndPromTypes() expvar.Var {
-	st := &SomeStats{
-		Nested: SomeNested{
-			FooG: 1,
-			BarC: 2,
-			Omit: 3,
-		},
-		NestedPtr: &SomeNested{
-			FooG: 10,
-			BarC: 20,
-		},
-		CurX:    3,
-		TotalY:  4,
-		CurTemp: 20.6,
-		AnInt8:  127,
-		AUint16: 65535,
-	}
-	return expvarAdapter{st}
-}
-
-type expvarAdapter struct {
-	st *SomeStats
-}
-
-func (expvarAdapter) String() string { return "{}" } // expvar JSON; unused in test
-
-func (a expvarAdapter) PrometheusMetricsReflectRoot() any {
-	return a.st
-}
-
-// SomeTestOfFieldNamesSorting demonstrates field
-// names that are not in sorted in declaration order, to verify
-// that we sort based on field name
-type SomeTestOfFieldNamesSorting struct {
-	FooAG int64 `json:"foo_a" metrictype:"gauge"`
-	BarAG int64 `json:"bar_a" metrictype:"gauge"`
-	FooBC int64 `json:"foo_b" metrictype:"counter"`
-	BarBC int64 `json:"bar_b" metrictype:"counter"`
-}
-
-// someExpVarWithFieldNamesSorting returns an expvar.Var that
-// implements PrometheusMetricsReflectRooter for TestVarzHandler.
-func someExpVarWithFieldNamesSorting() expvar.Var {
-	st := &SomeTestOfFieldNamesSorting{
-		FooAG: 1,
-		BarAG: 1,
-		FooBC: 1,
-		BarBC: 1,
-	}
-	return expvarAdapter2{st}
-}
-
-type expvarAdapter2 struct {
-	st *SomeTestOfFieldNamesSorting
-}
-
-func (expvarAdapter2) String() string { return "{}" } // expvar JSON; unused in test
-
-func (a expvarAdapter2) PrometheusMetricsReflectRoot() any {
-	return a.st
-}
-
-type promWriter struct{}
-
-func (promWriter) WritePrometheus(w io.Writer, prefix string) {
-	fmt.Fprintf(w, "%s_value 42\n", prefix)
-}
-
-func (promWriter) String() string {
-	return ""
 }
 
 func TestAcceptsEncoding(t *testing.T) {
@@ -729,45 +620,98 @@ func TestPort80Handler(t *testing.T) {
 	}
 }
 
-func TestSortedStructAllocs(t *testing.T) {
-	f := reflect.ValueOf(struct {
-		Foo int
-		Bar int
-		Baz int
-	}{})
-	n := testing.AllocsPerRun(1000, func() {
-		foreachExportedStructField(f, func(fieldOrJSONName, metricType string, rv reflect.Value) {
-			// Nothing.
-		})
-	})
-	if n != 0 {
-		t.Errorf("allocs = %v; want 0", n)
+func TestCleanRedirectURL(t *testing.T) {
+	tailscaleHost := []string{"tailscale.com"}
+	tailscaleAndOtherHost := []string{"microsoft.com", "tailscale.com"}
+	localHost := []string{"127.0.0.1", "localhost"}
+	myServer := []string{"myserver"}
+	cases := []struct {
+		url     string
+		hosts   []string
+		want    string
+		wantErr bool
+	}{
+		{"http://tailscale.com/foo", tailscaleHost, "http://tailscale.com/foo", false},
+		{"http://tailscale.com/foo", tailscaleAndOtherHost, "http://tailscale.com/foo", false},
+		{"http://microsoft.com/foo", tailscaleAndOtherHost, "http://microsoft.com/foo", false},
+		{"https://tailscale.com/foo", tailscaleHost, "https://tailscale.com/foo", false},
+		{"/foo", tailscaleHost, "/foo", false},
+		{"//tailscale.com/foo", tailscaleHost, "//tailscale.com/foo", false},
+		{"/a/foobar", tailscaleHost, "/a/foobar", false},
+		{"http://127.0.0.1/a/foobar", localHost, "http://127.0.0.1/a/foobar", false},
+		{"http://127.0.0.1:123/a/foobar", localHost, "http://127.0.0.1:123/a/foobar", false},
+		{"http://127.0.0.1:31544/a/foobar", localHost, "http://127.0.0.1:31544/a/foobar", false},
+		{"http://localhost/a/foobar", localHost, "http://localhost/a/foobar", false},
+		{"http://localhost:123/a/foobar", localHost, "http://localhost:123/a/foobar", false},
+		{"http://localhost:31544/a/foobar", localHost, "http://localhost:31544/a/foobar", false},
+		{"http://myserver/a/foobar", myServer, "http://myserver/a/foobar", false},
+		{"http://myserver:123/a/foobar", myServer, "http://myserver:123/a/foobar", false},
+		{"http://myserver:31544/a/foobar", myServer, "http://myserver:31544/a/foobar", false},
+		{"http://evil.com/foo", tailscaleHost, "", true},
+		{"//evil.com", tailscaleHost, "", true},
+		{"\\\\evil.com", tailscaleHost, "", true},
+		{"javascript:alert(123)", tailscaleHost, "", true},
+		{"file:///", tailscaleHost, "", true},
+		{"file:////SERVER/directory/goats.txt", tailscaleHost, "", true},
+		{"https://google.com", tailscaleHost, "", true},
+		{"", tailscaleHost, "", false},
+		{"\"\"", tailscaleHost, "", true},
+		{"https://tailscale.com@goats.com:8443", tailscaleHost, "", true},
+		{"https://tailscale.com:8443@goats.com:8443", tailscaleHost, "", true},
+		{"HttP://tailscale.com", tailscaleHost, "http://tailscale.com", false},
+		{"http://TaIlScAlE.CoM/spongebob", tailscaleHost, "http://TaIlScAlE.CoM/spongebob", false},
+		{"ftp://tailscale.com", tailscaleHost, "", true},
+		{"https:/evil.com", tailscaleHost, "", true},                     // regression test for tailscale/corp#892
+		{"%2Fa%2F44869c061701", tailscaleHost, "/a/44869c061701", false}, // regression test for tailscale/corp#13288
+		{"https%3A%2Ftailscale.com", tailscaleHost, "", true},            // escaped colon-single-slash malformed URL
+		{"", nil, "", false},
+	}
+
+	for _, tc := range cases {
+		gotURL, err := CleanRedirectURL(tc.url, tc.hosts)
+		if err != nil {
+			if !tc.wantErr {
+				t.Errorf("CleanRedirectURL(%q, %v) got error: %v", tc.url, tc.hosts, err)
+			}
+		} else {
+			if tc.wantErr {
+				t.Errorf("CleanRedirectURL(%q, %v) got %q, want an error", tc.url, tc.hosts, gotURL)
+			}
+			if got := gotURL.String(); got != tc.want {
+				t.Errorf("CleanRedirectURL(%q, %v) = %q, want %q", tc.url, tc.hosts, got, tc.want)
+			}
+		}
 	}
 }
 
-func TestVarzHandlerSorting(t *testing.T) {
-	defer func() { expvarDo = expvar.Do }()
-	expvarDo = func(f func(expvar.KeyValue)) {
-		f(expvar.KeyValue{Key: "counter_zz", Value: new(expvar.Int)})
-		f(expvar.KeyValue{Key: "gauge_aa", Value: new(expvar.Int)})
+func TestBucket(t *testing.T) {
+	tcs := []struct {
+		path string
+		want string
+	}{
+		{"/map", "/map"},
+		{"/key?v=63", "/key"},
+		{"/map/a87e865a9d1c7", "/map/…"},
+		{"/machine/37fc1acb57f256b69b0d76749d814d91c68b241057c6b127fee3df37e4af111e", "/machine/…"},
+		{"/machine/37fc1acb57f256b69b0d76749d814d91c68b241057c6b127fee3df37e4af111e/map", "/machine/…/map"},
+		{"/api/v2/tailnet/jeremiah@squish.com/devices", "/api/v2/tailnet/…/devices"},
+		{"/machine/ssh/wait/5227109621243650/to/7111899293970143/a/a9e4e04cc01b", "/machine/ssh/wait/…/to/…/a/…"},
+		{"/a/831a4bf39856?refreshed=true", "/a/…"},
+		{"/c2n/nxaaa1CNTRL", "/c2n/…"},
+		{"/api/v2/tailnet/blueberries.com/keys/kxaDK21CNTRL", "/api/v2/tailnet/…/keys/…"},
+		{"/api/v2/tailnet/bloop@passkey/devices", "/api/v2/tailnet/…/devices"},
 	}
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/", nil)
-	VarzHandler(rec, req)
-	got := rec.Body.Bytes()
-	const want = "# TYPE aa gauge\naa 0\n# TYPE zz counter\nzz 0\n"
-	if string(got) != want {
-		t.Errorf("got %q; want %q", got, want)
-	}
-	rec = new(httptest.ResponseRecorder) // without a body
 
-	// Lock in the current number of allocs, to prevent it from growing.
-	if !version.IsRace() {
-		allocs := int(testing.AllocsPerRun(1000, func() {
-			VarzHandler(rec, req)
-		}))
-		if max := 13; allocs > max {
-			t.Errorf("allocs = %v; want max %v", allocs, max)
-		}
+	for _, tc := range tcs {
+		t.Run(tc.path, func(t *testing.T) {
+			o := BucketedStatsOptions{}
+			bucket := (&o).bucketForRequest(&http.Request{
+				URL: must.Get(url.Parse(tc.path)),
+			})
+
+			if bucket != tc.want {
+				t.Errorf("bucket for %q was %q, want %q", tc.path, bucket, tc.want)
+			}
+		})
 	}
 }

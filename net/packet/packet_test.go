@@ -1,17 +1,20 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package packet
 
 import (
 	"bytes"
+	"encoding/hex"
 	"net/netip"
 	"reflect"
+	"strings"
 	"testing"
+	"unicode"
 
 	"tailscale.com/tstest"
 	"tailscale.com/types/ipproto"
+	"tailscale.com/util/must"
 )
 
 const (
@@ -69,18 +72,6 @@ var icmp4ReplyBuffer = []byte{
 	0x00, 0x00, 0xe6, 0x9e,
 	// "reply_payload"
 	0x72, 0x65, 0x70, 0x6c, 0x79, 0x5f, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64,
-}
-
-var icmp4ReplyDecode = Parsed{
-	b:       icmp4ReplyBuffer,
-	subofs:  20,
-	dataofs: 24,
-	length:  len(icmp4ReplyBuffer),
-
-	IPVersion: 4,
-	IPProto:   ICMPv4,
-	Src:       mustIPPort("1.2.3.4:0"),
-	Dst:       mustIPPort("5.6.7.8:0"),
 }
 
 // ICMPv6 Router Solicitation
@@ -252,17 +243,6 @@ var udp4ReplyBuffer = []byte{
 	0x02, 0x37, 0x00, 0x7b, 0x00, 0x15, 0xd3, 0x9d,
 	// "reply_payload"
 	0x72, 0x65, 0x70, 0x6c, 0x79, 0x5f, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64,
-}
-
-var udp4ReplyDecode = Parsed{
-	b:       udp4ReplyBuffer,
-	subofs:  20,
-	dataofs: 28,
-	length:  len(udp4ReplyBuffer),
-
-	IPProto: UDP,
-	Src:     mustIPPort("1.2.3.4:567"),
-	Dst:     mustIPPort("5.6.7.8:123"),
 }
 
 // First TCP fragment of a packet with leading 24 bytes of 'a's
@@ -440,6 +420,17 @@ func TestParsedString(t *testing.T) {
 	}
 }
 
+// mustHexDecode is like hex.DecodeString, but panics on error
+// and ignores whitespace in s.
+func mustHexDecode(s string) []byte {
+	return must.Get(hex.DecodeString(strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)))
+}
+
 func TestDecode(t *testing.T) {
 	tests := []struct {
 		name string
@@ -459,6 +450,29 @@ func TestDecode(t *testing.T) {
 		{"ipv4_sctp", sctpBuffer, sctpDecode},
 		{"ipv4_frag", tcp4MediumFragmentBuffer, tcp4MediumFragmentDecode},
 		{"ipv4_fragtooshort", tcp4ShortFragmentBuffer, tcp4ShortFragmentDecode},
+
+		{"ip97", mustHexDecode("4500 0019 d186 4000 4061 751d 644a 4603 6449 e549 6865 6c6c 6f"), Parsed{
+			IPVersion: 4,
+			IPProto:   97,
+			Src:       netip.MustParseAddrPort("100.74.70.3:0"),
+			Dst:       netip.MustParseAddrPort("100.73.229.73:0"),
+			b:         mustHexDecode("4500 0019 d186 4000 4061 751d 644a 4603 6449 e549 6865 6c6c 6f"),
+			length:    25,
+			subofs:    20,
+		}},
+
+		// This packet purports to use protocol 0xFF, which is verboten and
+		// used internally as a sentinel value for fragments. So test that
+		// we map packets using 0xFF to Unknown (0) instead.
+		{"bogus_proto_ff", mustHexDecode("4500 0019 d186 4000 40" + "FF" /* bogus FF */ + " 751d 644a 4603 6449 e549 6865 6c6c 6f"), Parsed{
+			IPVersion: 4,
+			IPProto:   ipproto.Unknown, // 0, not bogus 0xFF
+			Src:       netip.MustParseAddrPort("100.74.70.3:0"),
+			Dst:       netip.MustParseAddrPort("100.73.229.73:0"),
+			b:         mustHexDecode("4500 0019 d186 4000 40" + "FF" /* bogus FF */ + " 751d 644a 4603 6449 e549 6865 6c6c 6f"),
+			length:    25,
+			subofs:    20,
+		}},
 	}
 
 	for _, tt := range tests {
@@ -498,7 +512,7 @@ func BenchmarkDecode(b *testing.B) {
 	for _, bench := range benches {
 		b.Run(bench.name, func(b *testing.B) {
 			b.ReportAllocs()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				var p Parsed
 				p.Decode(bench.buf)
 			}
@@ -610,7 +624,7 @@ func BenchmarkString(b *testing.B) {
 			var p Parsed
 			p.Decode(bench.buf)
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for range b.N {
 				sinkString = p.String()
 			}
 		})

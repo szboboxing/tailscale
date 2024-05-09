@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cstruct
 
@@ -79,7 +78,7 @@ func TestDecoder(t *testing.T) {
 		dec := func(n int) *Decoder {
 			// Make a buffer of the exact size that consists of 0xff bytes
 			buf := make([]byte, n)
-			for i := 0; i < n; i++ {
+			for i := range n {
 				buf[i] = 0xff
 			}
 
@@ -109,7 +108,7 @@ func TestDecoder(t *testing.T) {
 		dec := func(n int) *Decoder {
 			// Make a buffer that's too small and contains arbitrary bytes
 			buf := make([]byte, n-1)
-			for i := 0; i < n-1; i++ {
+			for i := range n - 1 {
 				buf[i] = 0xAD
 			}
 

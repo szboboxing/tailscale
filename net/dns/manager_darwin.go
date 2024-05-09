@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
@@ -9,11 +8,12 @@ import (
 	"os"
 
 	"go4.org/mem"
+	"tailscale.com/health"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/mak"
 )
 
-func NewOSConfigurator(logf logger.Logf, ifName string) (OSConfigurator, error) {
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, ifName string) (OSConfigurator, error) {
 	return &darwinConfigurator{logf: logf, ifName: ifName}, nil
 }
 
@@ -37,15 +37,11 @@ func (c *darwinConfigurator) SupportsSplitDNS() bool {
 func (c *darwinConfigurator) SetDNS(cfg OSConfig) error {
 	var buf bytes.Buffer
 	buf.WriteString(macResolverFileHeader)
-	for i, ip := range cfg.Nameservers {
-		if i == 0 {
-			buf.WriteString("nameserver ")
-		} else {
-			buf.WriteString(" ")
-		}
+	for _, ip := range cfg.Nameservers {
+		buf.WriteString("nameserver ")
 		buf.WriteString(ip.String())
+		buf.WriteString("\n")
 	}
-	buf.WriteString("\n")
 
 	if err := os.MkdirAll("/etc/resolver", 0755); err != nil {
 		return err

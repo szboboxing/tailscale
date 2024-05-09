@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -19,38 +18,49 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/time/rate"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/envknob"
-	"tailscale.com/ipn"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/syncs"
 	"tailscale.com/tailcfg"
+	tsrate "tailscale.com/tstime/rate"
+	"tailscale.com/util/quarantine"
+	"tailscale.com/util/truncate"
 	"tailscale.com/version"
 )
 
 var fileCmd = &ffcli.Command{
 	Name:       "file",
-	ShortUsage: "file <cp|get> ...",
+	ShortUsage: "tailscale file <cp|get> ...",
 	ShortHelp:  "Send or receive files",
 	Subcommands: []*ffcli.Command{
 		fileCpCmd,
 		fileGetCmd,
 	},
-	Exec: func(context.Context, []string) error {
-		// TODO(bradfitz): is there a better ffcli way to
-		// annotate subcommand-required commands that don't
-		// have an exec body of their own?
-		return errors.New("file subcommand required; run 'tailscale file -h' for details")
-	},
+}
+
+type countingReader struct {
+	io.Reader
+	n atomic.Int64
+}
+
+func (c *countingReader) Read(buf []byte) (int, error) {
+	n, err := c.Reader.Read(buf)
+	c.n.Add(int64(n))
+	return n, err
 }
 
 var fileCpCmd = &ffcli.Command{
 	Name:       "cp",
-	ShortUsage: "file cp <files...> <target>:",
+	ShortUsage: "tailscale file cp <files...> <target>:",
 	ShortHelp:  "Copy file(s) to a host",
 	Exec:       runCp,
 	FlagSet: (func() *flag.FlagSet {
@@ -76,10 +86,10 @@ func runCp(ctx context.Context, args []string) error {
 		return errors.New("usage: tailscale file cp <files...> <target>:")
 	}
 	files, target := args[:len(args)-1], args[len(args)-1]
-	if !strings.HasSuffix(target, ":") {
+	target, ok := strings.CutSuffix(target, ":")
+	if !ok {
 		return fmt.Errorf("final argument to 'tailscale file cp' must end in colon")
 	}
-	target = strings.TrimSuffix(target, ":")
 	hadBrackets := false
 	if strings.HasPrefix(target, "[") && strings.HasSuffix(target, "]") {
 		hadBrackets = true
@@ -115,11 +125,11 @@ func runCp(ctx context.Context, args []string) error {
 	}
 
 	for _, fileArg := range files {
-		var fileContents io.Reader
+		var fileContents *countingReader
 		var name = cpArgs.name
 		var contentLength int64 = -1
 		if fileArg == "-" {
-			fileContents = os.Stdin
+			fileContents = &countingReader{Reader: os.Stdin}
 			if name == "" {
 				name, fileContents, err = pickStdinFilename()
 				if err != nil {
@@ -143,20 +153,30 @@ func runCp(ctx context.Context, args []string) error {
 				return errors.New("directories not supported")
 			}
 			contentLength = fi.Size()
-			fileContents = io.LimitReader(f, contentLength)
+			fileContents = &countingReader{Reader: io.LimitReader(f, contentLength)}
 			if name == "" {
 				name = filepath.Base(fileArg)
 			}
 
 			if envknob.Bool("TS_DEBUG_SLOW_PUSH") {
-				fileContents = &slowReader{r: fileContents}
+				fileContents = &countingReader{Reader: &slowReader{r: fileContents}}
 			}
 		}
 
 		if cpArgs.verbose {
 			log.Printf("sending %q to %v/%v/%v ...", name, target, ip, stableID)
 		}
+
+		var group syncs.WaitGroup
+		ctxProgress, cancelProgress := context.WithCancel(ctx)
+		defer cancelProgress()
+		if isatty.IsTerminal(os.Stderr.Fd()) {
+			group.Go(func() { progressPrinter(ctxProgress, name, fileContents.n.Load, contentLength) })
+		}
+
 		err := localClient.PushFile(ctx, stableID, contentLength, name, fileContents)
+		cancelProgress()
+		group.Wait() // wait for progress printer to stop before reporting the error
 		if err != nil {
 			return err
 		}
@@ -165,6 +185,82 @@ func runCp(ctx context.Context, args []string) error {
 		}
 	}
 	return nil
+}
+
+func progressPrinter(ctx context.Context, name string, contentCount func() int64, contentLength int64) {
+	var rateValueFast, rateValueSlow tsrate.Value
+	rateValueFast.HalfLife = 1 * time.Second  // fast response for rate measurement
+	rateValueSlow.HalfLife = 10 * time.Second // slow response for ETA measurement
+	var prevContentCount int64
+	print := func() {
+		currContentCount := contentCount()
+		rateValueFast.Add(float64(currContentCount - prevContentCount))
+		rateValueSlow.Add(float64(currContentCount - prevContentCount))
+		prevContentCount = currContentCount
+
+		const vtRestartLine = "\r\x1b[K"
+		fmt.Fprintf(os.Stderr, "%s%s    %s    %s",
+			vtRestartLine,
+			rightPad(name, 36),
+			leftPad(formatIEC(float64(currContentCount), "B"), len("1023.00MiB")),
+			leftPad(formatIEC(rateValueFast.Rate(), "B/s"), len("1023.00MiB/s")))
+		if contentLength >= 0 {
+			currContentCount = min(currContentCount, contentLength) // cap at 100%
+			ratioRemain := float64(currContentCount) / float64(contentLength)
+			bytesRemain := float64(contentLength - currContentCount)
+			secsRemain := bytesRemain / rateValueSlow.Rate()
+			secs := int(min(max(0, secsRemain), 99*60*60+59+60+59))
+			fmt.Fprintf(os.Stderr, "    %s    %s",
+				leftPad(fmt.Sprintf("%0.2f%%", 100.0*ratioRemain), len("100.00%")),
+				fmt.Sprintf("ETA %02d:%02d:%02d", secs/60/60, (secs/60)%60, secs%60))
+		}
+	}
+
+	tc := time.NewTicker(250 * time.Millisecond)
+	defer tc.Stop()
+	print()
+	for {
+		select {
+		case <-ctx.Done():
+			print()
+			fmt.Fprintln(os.Stderr)
+			return
+		case <-tc.C:
+			print()
+		}
+	}
+}
+
+func leftPad(s string, n int) string {
+	s = truncateString(s, n)
+	return strings.Repeat(" ", max(n-len(s), 0)) + s
+}
+
+func rightPad(s string, n int) string {
+	s = truncateString(s, n)
+	return s + strings.Repeat(" ", max(n-len(s), 0))
+}
+
+func truncateString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return truncate.String(s, max(n-1, 0)) + "…"
+}
+
+func formatIEC(n float64, unit string) string {
+	switch {
+	case n < 1<<10:
+		return fmt.Sprintf("%0.2f%s", n/(1<<0), unit)
+	case n < 1<<20:
+		return fmt.Sprintf("%0.2fKi%s", n/(1<<10), unit)
+	case n < 1<<30:
+		return fmt.Sprintf("%0.2fMi%s", n/(1<<20), unit)
+	case n < 1<<40:
+		return fmt.Sprintf("%0.2fGi%s", n/(1<<30), unit)
+	default:
+		return fmt.Sprintf("%0.2fTi%s", n/(1<<40), unit)
+	}
 }
 
 func getTargetStableID(ctx context.Context, ipStr string) (id tailcfg.StableNodeID, isOffline bool, err error) {
@@ -229,12 +325,12 @@ func ext(b []byte) string {
 // pickStdinFilename reads a bit of stdin to return a good filename
 // for its contents. The returned Reader is the concatenation of the
 // read and unread bits.
-func pickStdinFilename() (name string, r io.Reader, err error) {
+func pickStdinFilename() (name string, r *countingReader, err error) {
 	sniff, err := io.ReadAll(io.LimitReader(os.Stdin, maxSniff))
 	if err != nil {
 		return "", nil, err
 	}
-	return "stdin" + ext(sniff), io.MultiReader(bytes.NewReader(sniff), os.Stdin), nil
+	return "stdin" + ext(sniff), &countingReader{Reader: io.MultiReader(bytes.NewReader(sniff), os.Stdin)}, nil
 }
 
 type slowReader struct {
@@ -311,7 +407,7 @@ func (v *onConflict) Set(s string) error {
 
 var fileGetCmd = &ffcli.Command{
 	Name:       "get",
-	ShortUsage: "file get [--wait] [--verbose] [--conflict=(skip|overwrite|rename)] <target-directory>",
+	ShortUsage: "tailscale file get [--wait] [--verbose] [--conflict=(skip|overwrite|rename)] <target-directory>",
 	ShortHelp:  "Move files out of the Tailscale file inbox",
 	Exec:       runFileGet,
 	FlagSet: (func() *flag.FlagSet {
@@ -319,10 +415,11 @@ var fileGetCmd = &ffcli.Command{
 		fs.BoolVar(&getArgs.wait, "wait", false, "wait for a file to arrive if inbox is empty")
 		fs.BoolVar(&getArgs.loop, "loop", false, "run get in a loop, receiving files as they come in")
 		fs.BoolVar(&getArgs.verbose, "verbose", false, "verbose output")
-		fs.Var(&getArgs.conflict, "conflict", `behavior when a conflicting (same-named) file already exists in the target directory.
+		fs.Var(&getArgs.conflict, "conflict", "`behavior`"+` when a conflicting (same-named) file already exists in the target directory.
 	skip:       skip conflicting files: leave them in the taildrop inbox and print an error. get any non-conflicting files
 	overwrite:  overwrite existing file
 	rename:     write to a new number-suffixed filename`)
+		ffcomplete.Flag(fs, "conflict", ffcomplete.Fixed("skip", "overwrite", "rename"))
 		return fs
 	})(),
 }
@@ -393,6 +490,10 @@ func receiveFile(ctx context.Context, wf apitype.WaitingFile, dir string) (targe
 	if err != nil {
 		return "", 0, err
 	}
+	// Apply quarantine attribute before copying
+	if err := quarantine.SetOnFile(f); err != nil {
+		return "", 0, fmt.Errorf("failed to apply quarantine attribute to file %v: %v", f.Name(), err)
+	}
 	_, err = io.Copy(f, rc)
 	if err != nil {
 		f.Close()
@@ -455,7 +556,7 @@ func runFileGetOneBatch(ctx context.Context, dir string) []error {
 
 func runFileGet(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: file get <target-directory>")
+		return errors.New("usage: tailscale file get <target-directory>")
 	}
 	log.SetFlags(0)
 
@@ -523,30 +624,16 @@ func wipeInbox(ctx context.Context) error {
 }
 
 func waitForFile(ctx context.Context) error {
-	c, bc, pumpCtx, cancel := connect(ctx)
-	defer cancel()
-	fileWaiting := make(chan bool, 1)
-	notifyError := make(chan error, 1)
-	bc.SetNotifyCallback(func(n ipn.Notify) {
-		if n.ErrMessage != nil {
-			notifyError <- fmt.Errorf("Notify.ErrMessage: %v", *n.ErrMessage)
+	for {
+		ff, err := localClient.AwaitWaitingFiles(ctx, time.Hour)
+		if len(ff) > 0 {
+			return nil
 		}
-		if n.FilesWaiting != nil {
-			select {
-			case fileWaiting <- true:
-			default:
-			}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-	})
-	go pump(pumpCtx, bc, c)
-	select {
-	case <-fileWaiting:
-		return nil
-	case <-pumpCtx.Done():
-		return pumpCtx.Err()
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-notifyError:
-		return err
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+			return err
+		}
 	}
 }

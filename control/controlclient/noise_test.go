@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package controlclient
 
@@ -17,6 +16,7 @@ import (
 
 	"golang.org/x/net/http2"
 	"tailscale.com/control/controlhttp"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
@@ -74,8 +74,13 @@ func (tt noiseClientTest) run(t *testing.T) {
 	})
 	defer hs.Close()
 
-	dialer := new(tsdial.Dialer)
-	nc, err := NewNoiseClient(clientPrivate, serverPrivate.Public(), hs.URL, dialer, nil)
+	dialer := tsdial.NewDialer(netmon.NewStatic())
+	nc, err := NewNoiseClient(NoiseOpts{
+		PrivKey:      clientPrivate,
+		ServerPubKey: serverPrivate.Public(),
+		ServerURL:    hs.URL,
+		Dialer:       dialer,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +129,7 @@ func (tt noiseClientTest) run(t *testing.T) {
 	checkRes(t, res)
 
 	// And try using the high-level nc.post API as well.
-	res, err = nc.post(context.Background(), "/", nil)
+	res, err = nc.post(context.Background(), "/", key.NodePublic{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

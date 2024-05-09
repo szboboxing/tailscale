@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tstest
 
@@ -14,8 +13,19 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
+// ResourceCheck takes a snapshot of the current goroutines and registers a
+// cleanup on tb to verify that after the rest, all goroutines created by the
+// test go away. (well, at least that the count matches. Maybe in the future it
+// can look at specific routines).
+//
+// It panics if called from a parallel test.
 func ResourceCheck(tb testing.TB) {
 	tb.Helper()
+
+	// Set an environment variable (anything at all) just for the
+	// side effect of tb.Setenv panicking if we're in a parallel test.
+	tb.Setenv("TS_CHECKING_RESOURCES", "1")
+
 	startN, startStacks := goroutines()
 	tb.Cleanup(func() {
 		if tb.Failed() {
@@ -23,11 +33,11 @@ func ResourceCheck(tb testing.TB) {
 			return
 		}
 		// Goroutines might be still exiting.
-		for i := 0; i < 100; i++ {
+		for range 300 {
 			if runtime.NumGoroutine() <= startN {
 				return
 			}
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 		endN, endStacks := goroutines()
 		if endN <= startN {

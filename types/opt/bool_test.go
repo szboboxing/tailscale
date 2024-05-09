@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package opt
 
@@ -118,5 +117,13 @@ func TestBoolEqualBool(t *testing.T) {
 		if got := tt.b.EqualBool(tt.v); got != tt.want {
 			t.Errorf("(%q).EqualBool(%v) = %v; want %v", string(tt.b), tt.v, got, tt.want)
 		}
+	}
+}
+
+func TestUnmarshalAlloc(t *testing.T) {
+	b := json.Unmarshaler(new(Bool))
+	n := testing.AllocsPerRun(10, func() { b.UnmarshalJSON(trueBytes) })
+	if n > 0 {
+		t.Errorf("got %v allocs, want 0", n)
 	}
 }

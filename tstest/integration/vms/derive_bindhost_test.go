@@ -1,28 +1,26 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package vms
 
 import (
-	"io"
 	"net/netip"
 	"runtime"
 	"testing"
 
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 )
 
 func deriveBindhost(t *testing.T) string {
 	t.Helper()
 
-	ifName, err := interfaces.DefaultRouteInterface()
+	ifName, err := netmon.DefaultRouteInterface()
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	var ret string
-	err = interfaces.ForeachInterfaceAddress(func(i interfaces.Interface, prefix netip.Prefix) {
+	err = netmon.ForeachInterfaceAddress(func(i netmon.Interface, prefix netip.Prefix) {
 		if ret != "" || i.Name != ifName {
 			return
 		}
@@ -44,9 +42,3 @@ func TestDeriveBindhost(t *testing.T) {
 	}
 	t.Log(deriveBindhost(t))
 }
-
-type nopWriteCloser struct {
-	io.Writer
-}
-
-func (nwc nopWriteCloser) Close() error { return nil }

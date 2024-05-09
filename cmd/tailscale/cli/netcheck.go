@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -20,14 +19,16 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/net/netcheck"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/portmapper"
+	"tailscale.com/net/tlsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 )
 
 var netcheckCmd = &ffcli.Command{
 	Name:       "netcheck",
-	ShortUsage: "netcheck",
+	ShortUsage: "tailscale netcheck",
 	ShortHelp:  "Print an analysis of local network conditions",
 	Exec:       runNetcheck,
 	FlagSet: (func() *flag.FlagSet {
@@ -46,9 +47,15 @@ var netcheckArgs struct {
 }
 
 func runNetcheck(ctx context.Context, args []string) error {
+	logf := logger.WithPrefix(log.Printf, "portmap: ")
+	netMon, err := netmon.New(logf)
+	if err != nil {
+		return err
+	}
 	c := &netcheck.Client{
-		UDPBindAddr: envknob.String("TS_DEBUG_NETCHECK_UDP_BIND"),
-		PortMapper:  portmapper.NewClient(logger.WithPrefix(log.Printf, "portmap: "), nil),
+		NetMon:      netMon,
+		PortMapper:  portmapper.NewClient(logf, netMon, nil, nil, nil),
+		UseDNSCache: false, // always resolve, don't cache
 	}
 	if netcheckArgs.verbose {
 		c.Logf = logger.WithPrefix(log.Printf, "netcheck: ")
@@ -61,20 +68,25 @@ func runNetcheck(ctx context.Context, args []string) error {
 		fmt.Fprintln(Stderr, "# Warning: this JSON format is not yet considered a stable interface")
 	}
 
+	if err := c.Standalone(ctx, envknob.String("TS_DEBUG_NETCHECK_UDP_BIND")); err != nil {
+		fmt.Fprintln(Stderr, "netcheck: UDP test failure:", err)
+	}
+
 	dm, err := localClient.CurrentDERPMap(ctx)
 	noRegions := dm != nil && len(dm.Regions) == 0
 	if noRegions {
 		log.Printf("No DERP map from tailscaled; using default.")
 	}
 	if err != nil || noRegions {
-		dm, err = prodDERPMap(ctx, http.DefaultClient)
+		hc := &http.Client{Transport: tlsdial.NewTransport()}
+		dm, err = prodDERPMap(ctx, hc)
 		if err != nil {
 			return err
 		}
 	}
 	for {
 		t0 := time.Now()
-		report, err := c.GetReport(ctx, dm)
+		report, err := c.GetReport(ctx, dm, nil)
 		d := time.Since(t0)
 		if netcheckArgs.verbose {
 			c.Logf("GetReport took %v; err=%v", d.Round(time.Millisecond), err)
@@ -97,7 +109,6 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	var err error
 	switch netcheckArgs.format {
 	case "":
-		break
 	case "json":
 		j, err = json.MarshalIndent(report, "", "\t")
 	case "json-line":
@@ -143,7 +154,11 @@ func printReport(dm *tailcfg.DERPMap, report *netcheck.Report) error {
 	if len(report.RegionLatency) == 0 {
 		printf("\t* Nearest DERP: unknown (no response to latency probes)\n")
 	} else {
-		printf("\t* Nearest DERP: %v\n", dm.Regions[report.PreferredDERP].RegionName)
+		if report.PreferredDERP != 0 {
+			printf("\t* Nearest DERP: %v\n", dm.Regions[report.PreferredDERP].RegionName)
+		} else {
+			printf("\t* Nearest DERP: [none]\n")
+		}
 		printf("\t* DERP latency:\n")
 		var rids []int
 		for rid := range dm.Regions {

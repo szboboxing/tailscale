@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -17,7 +16,7 @@ import (
 
 var ipCmd = &ffcli.Command{
 	Name:       "ip",
-	ShortUsage: "ip [-1] [-4] [-6] [peer hostname or ip address]",
+	ShortUsage: "tailscale ip [-1] [-4] [-6] [peer hostname or ip address]",
 	ShortHelp:  "Show Tailscale IP addresses",
 	LongHelp:   "Show Tailscale IP addresses for peer. Peer defaults to the current machine.",
 	Exec:       runIP,

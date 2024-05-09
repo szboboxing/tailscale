@@ -1,9 +1,7 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
-// +build linux
 
 package tshttpproxy
 
@@ -18,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"tailscale.com/tstest"
 )
 
 func TestSynologyProxyFromConfigCached(t *testing.T) {
@@ -26,9 +26,7 @@ func TestSynologyProxyFromConfigCached(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var orig string
-	orig, synologyProxyConfigPath = synologyProxyConfigPath, filepath.Join(t.TempDir(), "proxy.conf")
-	defer func() { synologyProxyConfigPath = orig }()
+	tstest.Replace(t, &synologyProxyConfigPath, filepath.Join(t.TempDir(), "proxy.conf"))
 
 	t.Run("no config file", func(t *testing.T) {
 		if _, err := os.Stat(synologyProxyConfigPath); err == nil {
@@ -162,11 +160,9 @@ func TestSynologyProxiesFromConfig(t *testing.T) {
 		openReader io.ReadCloser
 		openErr    error
 	)
-	var origOpen func() (io.ReadCloser, error)
-	origOpen, openSynologyProxyConf = openSynologyProxyConf, func() (io.ReadCloser, error) {
+	tstest.Replace(t, &openSynologyProxyConf, func() (io.ReadCloser, error) {
 		return openReader, openErr
-	}
-	defer func() { openSynologyProxyConf = origOpen }()
+	})
 
 	t.Run("with config", func(t *testing.T) {
 		mc := &mustCloser{Reader: strings.NewReader(`

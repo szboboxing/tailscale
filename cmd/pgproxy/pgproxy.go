@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // The pgproxy server is a proxy for the Postgres wire protocol.
 package main
@@ -273,7 +272,7 @@ func (p *proxy) serve(sessionID int64, c net.Conn) error {
 	}
 	if buf[0] != 'S' {
 		p.errors.Add("upstream-bad-protocol", 1)
-		return fmt.Errorf("upstream didn't acknowldge start-ssl, said %q", buf[0])
+		return fmt.Errorf("upstream didn't acknowledge start-ssl, said %q", buf[0])
 	}
 	tlsConf := &tls.Config{
 		ServerName: p.upstreamHost,

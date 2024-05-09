@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
@@ -17,18 +16,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
+	"tailscale.com/health"
 	"tailscale.com/net/dns/resolvconffile"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/version/distro"
-)
-
-const (
-	backupConf = "/etc/resolv.pre-tailscale-backup.conf"
-	resolvConf = "/etc/resolv.conf"
 )
 
 // writeResolvConf writes DNS configuration in resolv.conf format to the given writer.
@@ -54,6 +52,8 @@ func readResolv(r io.Reader) (OSConfig, error) {
 // resolvOwner returns the apparent owner of the resolv.conf
 // configuration in bs - one of "resolvconf", "systemd-resolved" or
 // "NetworkManager", or "" if no known owner was found.
+//
+//lint:ignore U1000 used in linux and freebsd code
 func resolvOwner(bs []byte) string {
 	likely := ""
 	b := bytes.NewBuffer(bs)
@@ -117,8 +117,9 @@ func restartResolved() error {
 // The caller must call Down before program shutdown
 // or as cleanup if the program terminates unexpectedly.
 type directManager struct {
-	logf logger.Logf
-	fs   wholeFileFS
+	logf   logger.Logf
+	health *health.Tracker
+	fs     wholeFileFS
 	// renameBroken is set if fs.Rename to or from /etc/resolv.conf
 	// fails. This can happen in some container runtimes, where
 	// /etc/resolv.conf is bind-mounted from outside the container,
@@ -130,20 +131,32 @@ type directManager struct {
 	// where a reader can see an empty or partial /etc/resolv.conf),
 	// but is better than having non-functioning DNS.
 	renameBroken bool
+
+	ctx      context.Context    // valid until Close
+	ctxClose context.CancelFunc // closes ctx
+
+	mu             sync.Mutex
+	wantResolvConf []byte // if non-nil, what we expect /etc/resolv.conf to contain
+	//lint:ignore U1000 used in direct_linux.go
+	lastWarnContents []byte // last resolv.conf contents that we warned about
 }
 
-func newDirectManager(logf logger.Logf) *directManager {
-	return &directManager{
-		logf: logf,
-		fs:   directFS{},
-	}
+//lint:ignore U1000 used in manager_{freebsd,openbsd}.go
+func newDirectManager(logf logger.Logf, health *health.Tracker) *directManager {
+	return newDirectManagerOnFS(logf, health, directFS{})
 }
 
-func newDirectManagerOnFS(logf logger.Logf, fs wholeFileFS) *directManager {
-	return &directManager{
-		logf: logf,
-		fs:   fs,
+func newDirectManagerOnFS(logf logger.Logf, health *health.Tracker, fs wholeFileFS) *directManager {
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &directManager{
+		logf:     logf,
+		health:   health,
+		fs:       fs,
+		ctx:      ctx,
+		ctxClose: cancel,
 	}
+	go m.runFileWatcher()
+	return m
 }
 
 func (m *directManager) readResolvFile(path string) (OSConfig, error) {
@@ -272,6 +285,17 @@ func (m *directManager) rename(old, new string) error {
 	return nil
 }
 
+// setWant sets the expected contents of /etc/resolv.conf, if any.
+//
+// A value of nil means no particular value is expected.
+//
+// m takes ownership of want.
+func (m *directManager) setWant(want []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.wantResolvConf = want
+}
+
 func (m *directManager) SetDNS(config OSConfig) (err error) {
 	defer func() {
 		if err != nil && errors.Is(err, fs.ErrPermission) && runtime.GOOS == "linux" &&
@@ -283,6 +307,7 @@ func (m *directManager) SetDNS(config OSConfig) (err error) {
 			err = nil
 		}
 	}()
+	m.setWant(nil) // reset our expectations before any work
 	var changed bool
 	if config.IsZero() {
 		changed, err = m.restoreBackup()
@@ -300,6 +325,11 @@ func (m *directManager) SetDNS(config OSConfig) (err error) {
 		if err := m.atomicWriteFile(m.fs, resolvConf, buf.Bytes(), 0644); err != nil {
 			return err
 		}
+
+		// Now that we've successfully written to the file, lock it in.
+		// If we see /etc/resolv.conf with different contents, we know somebody
+		// else trampled on it.
+		m.setWant(buf.Bytes())
 	}
 
 	// We might have taken over a configuration managed by resolved,
@@ -346,10 +376,38 @@ func (m *directManager) GetBaseConfig() (OSConfig, error) {
 		fileToRead = backupConf
 	}
 
-	return m.readResolvFile(fileToRead)
+	oscfg, err := m.readResolvFile(fileToRead)
+	if err != nil {
+		return OSConfig{}, err
+	}
+
+	// On some systems, the backup configuration file is actually a
+	// symbolic link to something owned by another DNS service (commonly,
+	// resolved). Thus, it can be updated out from underneath us to contain
+	// the Tailscale service IP, which results in an infinite loop of us
+	// trying to send traffic to resolved, which sends back to us, and so
+	// on. To solve this, drop the Tailscale service IP from the base
+	// configuration; we do this in all situations since there's
+	// essentially no world where we want to forward to ourselves.
+	//
+	// See: https://github.com/tailscale/tailscale/issues/7816
+	var removed bool
+	oscfg.Nameservers = slices.DeleteFunc(oscfg.Nameservers, func(ip netip.Addr) bool {
+		if ip == tsaddr.TailscaleServiceIP() || ip == tsaddr.TailscaleServiceIPv6() {
+			removed = true
+			return true
+		}
+		return false
+	})
+	if removed {
+		m.logf("[v1] dropped Tailscale IP from base config that was a symlink")
+	}
+	return oscfg, nil
 }
 
 func (m *directManager) Close() error {
+	m.ctxClose()
+
 	// We used to keep a file for the tailscale config and symlinked
 	// to it, but then we stopped because /etc/resolv.conf being a
 	// symlink to surprising places breaks snaps and other sandboxing

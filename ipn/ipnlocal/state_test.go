@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package ipnlocal
 
@@ -14,13 +13,15 @@ import (
 	qt "github.com/frankban/quicktest"
 
 	"tailscale.com/control/controlclient"
+	"tailscale.com/envknob"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsd"
 	"tailscale.com/tstest"
-	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/persist"
 	"tailscale.com/wgengine"
@@ -69,7 +70,7 @@ func (nt *notifyThrottler) drain(count int) []ipn.Notify {
 	nt.mu.Unlock()
 
 	nn := []ipn.Notify{}
-	for i := 0; i < count; i++ {
+	for i := range count {
 		select {
 		case n := <-ch:
 			nn = append(nn, n)
@@ -81,6 +82,7 @@ func (nt *notifyThrottler) drain(count int) []ipn.Notify {
 	// no more notifications expected
 	close(ch)
 
+	nt.t.Log(nn)
 	return nn
 }
 
@@ -89,43 +91,52 @@ func (nt *notifyThrottler) drain(count int) []ipn.Notify {
 // in the controlclient.Client, so by controlling it, we can check that
 // the state machine works as expected.
 type mockControl struct {
-	tb         testing.TB
-	opts       controlclient.Options
-	logfActual logger.Logf
-	statusFunc func(controlclient.Status)
+	tb     testing.TB
+	logf   logger.Logf
+	opts   controlclient.Options
+	paused atomic.Bool
 
 	mu          sync.Mutex
+	persist     *persist.Persist
 	calls       []string
 	authBlocked bool
-	persist     persist.Persist
-	machineKey  key.MachinePrivate
+	shutdown    chan struct{}
 }
 
-func newMockControl(tb testing.TB) *mockControl {
+func newClient(tb testing.TB, opts controlclient.Options) *mockControl {
 	return &mockControl{
 		tb:          tb,
 		authBlocked: true,
+		logf:        opts.Logf,
+		opts:        opts,
+		shutdown:    make(chan struct{}),
+		persist:     opts.Persist.Clone(),
 	}
 }
 
-func (cc *mockControl) logf(format string, args ...any) {
-	if cc.logfActual == nil {
-		return
+func (cc *mockControl) assertShutdown(wasPaused bool) {
+	cc.tb.Helper()
+	select {
+	case <-cc.shutdown:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		cc.tb.Fatalf("timed out waiting for shutdown")
 	}
-	cc.logfActual(format, args...)
+	if wasPaused {
+		cc.assertCalls("unpause", "Shutdown")
+	} else {
+		cc.assertCalls("Shutdown")
+	}
 }
 
 func (cc *mockControl) populateKeys() (newKeys bool) {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
-	if cc.machineKey.IsZero() {
-		cc.logf("Copying machineKey.")
-		cc.machineKey, _ = cc.opts.GetMachinePrivateKey()
-		newKeys = true
+	if cc.persist == nil {
+		cc.persist = &persist.Persist{}
 	}
-
-	if cc.persist.PrivateNodeKey.IsZero() {
+	if cc.persist != nil && cc.persist.PrivateNodeKey.IsZero() {
 		cc.logf("Generating a new nodekey.")
 		cc.persist.OldPrivateNodeKey = cc.persist.PrivateNodeKey
 		cc.persist.PrivateNodeKey = key.NewNode()
@@ -138,19 +149,24 @@ func (cc *mockControl) populateKeys() (newKeys bool) {
 // send publishes a controlclient.Status notification upstream.
 // (In our tests here, upstream is the ipnlocal.Local instance.)
 func (cc *mockControl) send(err error, url string, loginFinished bool, nm *netmap.NetworkMap) {
-	if cc.statusFunc != nil {
+	if loginFinished {
+		cc.mu.Lock()
+		cc.authBlocked = false
+		cc.mu.Unlock()
+	}
+	if cc.opts.Observer != nil {
 		s := controlclient.Status{
 			URL:     url,
 			NetMap:  nm,
-			Persist: &cc.persist,
+			Persist: cc.persist.View(),
 			Err:     err,
 		}
 		if loginFinished {
-			s.LoginFinished = &empty.Message{}
+			s.SetStateForTest(controlclient.StateAuthenticated)
 		} else if url == "" && err == nil && nm == nil {
-			s.LogoutFinished = &empty.Message{}
+			s.SetStateForTest(controlclient.StateNotAuthenticated)
 		}
-		cc.statusFunc(s)
+		cc.opts.Observer.SetControlClientStatus(cc, s)
 	}
 }
 
@@ -172,34 +188,16 @@ func (cc *mockControl) assertCalls(want ...string) {
 	cc.calls = nil
 }
 
-// setAuthBlocked changes the return value of AuthCantContinue.
-// Auth is blocked if you haven't called Login, the control server hasn't
-// provided an auth URL, or it has provided an auth URL and you haven't
-// visited it yet.
-func (cc *mockControl) setAuthBlocked(blocked bool) {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
-	cc.authBlocked = blocked
-}
-
 // Shutdown disconnects the client.
-//
-// Note that in a normal controlclient, Shutdown would be the last thing you
-// do before discarding the object. In this mock, we don't actually discard
-// the object, but if you see a call to Shutdown, you should always see a
-// call to New right after it, if the object continues to be used.
-// (Note that "New" is the ccGen function here; it means ipn.Backend wanted
-// to create an entirely new controlclient.)
 func (cc *mockControl) Shutdown() {
 	cc.logf("Shutdown")
 	cc.called("Shutdown")
+	close(cc.shutdown)
 }
 
-// Login starts a login process.
-// Note that in this mock, we don't automatically generate notifications
-// about the progress of the login operation. You have to call setAuthBlocked()
-// and send() as required by the test.
+// Login starts a login process. Note that in this mock, we don't automatically
+// generate notifications about the progress of the login operation. You have to
+// call send() as required by the test.
 func (cc *mockControl) Login(t *tailcfg.Oauth2Token, flags controlclient.LoginFlags) {
 	cc.logf("Login token=%v flags=%v", t, flags)
 	cc.called("Login")
@@ -207,12 +205,9 @@ func (cc *mockControl) Login(t *tailcfg.Oauth2Token, flags controlclient.LoginFl
 
 	interact := (flags & controlclient.LoginInteractive) != 0
 	cc.logf("Login: interact=%v newKeys=%v", interact, newKeys)
-	cc.setAuthBlocked(interact || newKeys)
-}
-
-func (cc *mockControl) StartLogout() {
-	cc.logf("StartLogout")
-	cc.called("StartLogout")
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	cc.authBlocked = interact || newKeys
 }
 
 func (cc *mockControl) Logout(ctx context.Context) error {
@@ -222,6 +217,10 @@ func (cc *mockControl) Logout(ctx context.Context) error {
 }
 
 func (cc *mockControl) SetPaused(paused bool) {
+	was := cc.paused.Swap(paused)
+	if was == paused {
+		return
+	}
 	cc.logf("SetPaused=%v", paused)
 	if paused {
 		cc.called("pause")
@@ -258,6 +257,17 @@ func (cc *mockControl) UpdateEndpoints(endpoints []tailcfg.Endpoint) {
 	cc.called("UpdateEndpoints")
 }
 
+func (b *LocalBackend) nonInteractiveLoginForStateTest() {
+	b.mu.Lock()
+	if b.cc == nil {
+		panic("LocalBackend.assertClient: b.cc == nil")
+	}
+	cc := b.cc
+	b.mu.Unlock()
+
+	cc.Login(nil, b.loginFlags|controlclient.LoginInteractive)
+}
+
 // A very precise test of the sequence of function calls generated by
 // ipnlocal.Local into its controlclient instance, and the events it
 // produces upstream into the UI.
@@ -280,33 +290,33 @@ func (cc *mockControl) UpdateEndpoints(endpoints []tailcfg.Endpoint) {
 // predictable, but maybe a bit less thorough. This is more of an overall
 // state machine test than a test of the wgengine+magicsock integration.
 func TestStateMachine(t *testing.T) {
+	envknob.Setenv("TAILSCALE_USE_WIP_CODE", "1")
+	defer envknob.Setenv("TAILSCALE_USE_WIP_CODE", "")
 	c := qt.New(t)
 
 	logf := tstest.WhileTestRunningLogger(t)
+	sys := new(tsd.System)
 	store := new(testStateStorage)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, 0)
+	sys.Set(store)
+	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker())
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
 	t.Cleanup(e.Close)
+	sys.Set(e)
 
-	b, err := NewLocalBackend(logf, "logid", store, nil, e, 0)
+	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
+	b.DisablePortMapperForTest()
 
-	cc := newMockControl(t)
-	cc.statusFunc = b.setClientStatus
-
+	var cc, previousCC *mockControl
 	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
-		cc.mu.Lock()
-		cc.opts = opts
-		cc.logfActual = opts.Logf
-		cc.authBlocked = true
-		cc.persist = cc.opts.Persist
-		cc.mu.Unlock()
+		previousCC = cc
+		cc = newClient(t, opts)
 
-		cc.logf("ccGen: new mockControl.")
+		t.Logf("ccGen: new mockControl.")
 		cc.called("New")
 		return cc, nil
 	})
@@ -319,26 +329,26 @@ func TestStateMachine(t *testing.T) {
 			(n.Prefs != nil && n.Prefs.Valid()) ||
 			n.BrowseToURL != nil ||
 			n.LoginFinished != nil {
-			logf("\n%v\n\n", n)
+			logf("%v\n\n", n)
 			notifies.put(n)
 		} else {
-			logf("\n(ignored) %v\n\n", n)
+			logf("(ignored) %v\n\n", n)
 		}
 	})
 
 	// Check that it hasn't called us right away.
 	// The state machine should be idle until we call Start().
-	cc.assertCalls()
+	c.Assert(cc, qt.IsNil)
 
 	// Start the state machine.
 	// Since !WantRunning by default, it'll create a controlclient,
 	// but not ask it to do anything yet.
 	t.Logf("\n\nStart")
 	notifies.expect(2)
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
 		// BUG: strictly, it should pause, not unpause, here, since !WantRunning.
-		cc.assertCalls("New", "unpause")
+		cc.assertCalls("New")
 
 		nn := notifies.drain(2)
 		cc.assertCalls()
@@ -348,7 +358,7 @@ func TestStateMachine(t *testing.T) {
 		// Note: a totally fresh system has Prefs.LoggedOut=false by
 		// default. We are logged out, but not because the user asked
 		// for it, so it doesn't count as Prefs.LoggedOut==true.
-		c.Assert(prefs.LoggedOut(), qt.IsFalse)
+		c.Assert(prefs.LoggedOut(), qt.IsTrue)
 		c.Assert(prefs.WantRunning(), qt.IsFalse)
 		c.Assert(ipn.NeedsLogin, qt.Equals, *nn[1].State)
 		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
@@ -360,16 +370,16 @@ func TestStateMachine(t *testing.T) {
 	// events as the first time, so UIs always know what to expect.
 	t.Logf("\n\nStart2")
 	notifies.expect(2)
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
-		// BUG: strictly, it should pause, not unpause, here, since !WantRunning.
-		cc.assertCalls("Shutdown", "unpause", "New", "unpause")
+		previousCC.assertShutdown(false)
+		cc.assertCalls("New")
 
 		nn := notifies.drain(2)
 		cc.assertCalls()
 		c.Assert(nn[0].Prefs, qt.IsNotNil)
 		c.Assert(nn[1].State, qt.IsNotNil)
-		c.Assert(nn[0].Prefs.LoggedOut(), qt.IsFalse)
+		c.Assert(nn[0].Prefs.LoggedOut(), qt.IsTrue)
 		c.Assert(nn[0].Prefs.WantRunning(), qt.IsFalse)
 		c.Assert(ipn.NeedsLogin, qt.Equals, *nn[1].State)
 		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
@@ -380,7 +390,7 @@ func TestStateMachine(t *testing.T) {
 	// then wait for us to respond.
 	t.Logf("\n\nLogin (noninteractive)")
 	notifies.expect(0)
-	b.Login(nil)
+	b.nonInteractiveLoginForStateTest()
 	{
 		cc.assertCalls("Login")
 		notifies.drain(0)
@@ -389,25 +399,34 @@ func TestStateMachine(t *testing.T) {
 		// (This behaviour is needed so that b.Login() won't
 		// start connecting to an old account right away, if one
 		// exists when you launch another login.)
+		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
 	}
 
 	// Attempted non-interactive login with no key; indicate that
 	// the user needs to visit a login URL.
 	t.Logf("\n\nLogin (url response)")
-	notifies.expect(1)
-	url1 := "http://localhost:1/1"
+
+	notifies.expect(2)
+	b.EditPrefs(&ipn.MaskedPrefs{
+		ControlURLSet: true,
+		Prefs: ipn.Prefs{
+			ControlURL: "https://localhost:1/",
+		},
+	})
+	url1 := "https://localhost:1/1"
 	cc.send(nil, url1, false, nil)
 	{
-		cc.assertCalls("unpause")
+		cc.assertCalls()
 
 		// ...but backend eats that notification, because the user
 		// didn't explicitly request interactive login yet, and
 		// we're already in NeedsLogin state.
-		nn := notifies.drain(1)
+		nn := notifies.drain(2)
 
-		c.Assert(nn[0].Prefs, qt.IsNotNil)
-		c.Assert(nn[0].Prefs.LoggedOut(), qt.IsFalse)
-		c.Assert(nn[0].Prefs.WantRunning(), qt.IsFalse)
+		c.Assert(nn[1].Prefs, qt.IsNotNil)
+		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsTrue)
+		c.Assert(nn[1].Prefs.WantRunning(), qt.IsFalse)
+		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
 	}
 
 	// Now we'll try an interactive login.
@@ -416,12 +435,13 @@ func TestStateMachine(t *testing.T) {
 	// indicating that the UI should browse to the given URL.
 	t.Logf("\n\nLogin (interactive)")
 	notifies.expect(1)
-	b.StartLoginInteractive()
+	b.StartLoginInteractive(context.Background())
 	{
 		nn := notifies.drain(1)
-		cc.assertCalls("unpause")
+		cc.assertCalls()
 		c.Assert(nn[0].BrowseToURL, qt.IsNotNil)
 		c.Assert(url1, qt.Equals, *nn[0].BrowseToURL)
+		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
 	}
 
 	// Sometimes users press the Login button again, in the middle of
@@ -431,26 +451,28 @@ func TestStateMachine(t *testing.T) {
 	// we must always get a *new* login URL first.
 	t.Logf("\n\nLogin2 (interactive)")
 	notifies.expect(0)
-	b.StartLoginInteractive()
+	b.StartLoginInteractive(context.Background())
 	{
 		notifies.drain(0)
 		// backend asks control for another login sequence
 		cc.assertCalls("Login")
+		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
 	}
 
 	// Provide a new interactive login URL.
 	t.Logf("\n\nLogin2 (url response)")
 	notifies.expect(1)
-	url2 := "http://localhost:1/2"
+	url2 := "https://localhost:1/2"
 	cc.send(nil, url2, false, nil)
 	{
-		cc.assertCalls("unpause", "unpause")
+		cc.assertCalls()
 
 		// This time, backend should emit it to the UI right away,
 		// because the UI is anxiously awaiting a new URL to visit.
 		nn := notifies.drain(1)
 		c.Assert(nn[0].BrowseToURL, qt.IsNotNil)
 		c.Assert(url2, qt.Equals, *nn[0].BrowseToURL)
+		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
 	}
 
 	// Pretend that the interactive login actually happened.
@@ -459,8 +481,8 @@ func TestStateMachine(t *testing.T) {
 	// The backend should propagate this upward for the UI.
 	t.Logf("\n\nLoginFinished")
 	notifies.expect(3)
-	cc.setAuthBlocked(false)
-	cc.persist.LoginName = "user1"
+	cc.persist.UserProfile.LoginName = "user1"
+	cc.persist.NodeID = "node1"
 	cc.send(nil, "", true, &netmap.NetworkMap{})
 	{
 		nn := notifies.drain(3)
@@ -472,12 +494,13 @@ func TestStateMachine(t *testing.T) {
 		// wait until it gets into Starting.
 		// TODO: (Currently this test doesn't detect that bug, but
 		// it's visible in the logs)
-		cc.assertCalls("unpause", "unpause", "unpause")
+		cc.assertCalls()
 		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
-		c.Assert(nn[1].Prefs.Persist().LoginName, qt.Equals, "user1")
+		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName, qt.Equals, "user1")
 		c.Assert(ipn.NeedsMachineAuth, qt.Equals, *nn[2].State)
+		c.Assert(ipn.NeedsMachineAuth, qt.Equals, b.State())
 	}
 
 	// Pretend that the administrator has authorized our machine.
@@ -490,11 +513,11 @@ func TestStateMachine(t *testing.T) {
 	// (ie. I suspect it would be better to change false->true in send()
 	// below, and do the same in the real controlclient.)
 	cc.send(nil, "", false, &netmap.NetworkMap{
-		MachineStatus: tailcfg.MachineAuthorized,
+		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
 	})
 	{
 		nn := notifies.drain(1)
-		cc.assertCalls("unpause", "unpause", "unpause")
+		cc.assertCalls()
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(ipn.Starting, qt.Equals, *nn[0].State)
 	}
@@ -535,7 +558,7 @@ func TestStateMachine(t *testing.T) {
 	{
 		nn := notifies.drain(2)
 		// BUG: Login isn't needed here. We never logged out.
-		cc.assertCalls("Login", "unpause", "unpause")
+		cc.assertCalls("Login", "unpause")
 		// BUG: I would expect Prefs to change first, and state after.
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
@@ -543,110 +566,60 @@ func TestStateMachine(t *testing.T) {
 		c.Assert(store.sawWrite(), qt.IsTrue)
 	}
 
-	// Test the fast-path frontend reconnection.
-	// This one is very finicky, so we have to force State==Running
-	// or it won't use the fast path.
-	// TODO: actually get to State==Running, rather than cheating.
-	//  That'll require spinning up a fake DERP server and putting it in
-	//  the netmap.
-	t.Logf("\n\nFastpath Start()")
-	notifies.expect(1)
-	b.state = ipn.Running
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
-	{
-		nn := notifies.drain(1)
-		cc.assertCalls()
-		c.Assert(nn[0].State, qt.IsNotNil)
-		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
-		c.Assert(nn[0].NetMap, qt.IsNotNil)
-		c.Assert(nn[0].Prefs, qt.IsNotNil)
-	}
-
 	// undo the state hack above.
 	b.state = ipn.Starting
 
 	// User wants to logout.
 	store.awaitWrite()
-	t.Logf("\n\nLogout (async)")
-	notifies.expect(2)
-	b.Logout()
+	t.Logf("\n\nLogout")
+	notifies.expect(5)
+	b.Logout(context.Background())
 	{
-		nn := notifies.drain(2)
-		cc.assertCalls("pause", "StartLogout", "pause")
+		nn := notifies.drain(5)
+		previousCC.assertCalls("pause", "Logout", "unpause", "Shutdown")
 		c.Assert(nn[0].State, qt.IsNotNil)
+		c.Assert(*nn[0].State, qt.Equals, ipn.Stopped)
+
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
-		c.Assert(ipn.Stopped, qt.Equals, *nn[0].State)
 		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsTrue)
 		c.Assert(nn[1].Prefs.WantRunning(), qt.IsFalse)
-		c.Assert(ipn.Stopped, qt.Equals, b.State())
+
+		cc.assertCalls("New")
+		c.Assert(nn[2].State, qt.IsNotNil)
+		c.Assert(*nn[2].State, qt.Equals, ipn.NoState)
+
+		c.Assert(nn[3].Prefs, qt.IsNotNil) // emptyPrefs
+		c.Assert(nn[3].Prefs.LoggedOut(), qt.IsTrue)
+		c.Assert(nn[3].Prefs.WantRunning(), qt.IsFalse)
+
+		c.Assert(nn[4].State, qt.IsNotNil)
+		c.Assert(*nn[4].State, qt.Equals, ipn.NeedsLogin)
+
+		c.Assert(b.State(), qt.Equals, ipn.NeedsLogin)
+
 		c.Assert(store.sawWrite(), qt.IsTrue)
 	}
 
-	// Let's make the logout succeed.
-	t.Logf("\n\nLogout (async) - succeed")
-	notifies.expect(1)
-	cc.setAuthBlocked(true)
-	cc.send(nil, "", false, nil)
-	{
-		nn := notifies.drain(1)
-		cc.assertCalls("unpause", "unpause")
-		c.Assert(nn[0].State, qt.IsNotNil)
-		c.Assert(ipn.NeedsLogin, qt.Equals, *nn[0].State)
-		c.Assert(b.Prefs().LoggedOut(), qt.IsTrue)
-		c.Assert(b.Prefs().WantRunning(), qt.IsFalse)
-		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
-	}
-
-	// A second logout should do nothing, since the prefs haven't changed.
-	t.Logf("\n\nLogout2 (async)")
+	// A second logout should be a no-op as we are in the NeedsLogin state.
+	t.Logf("\n\nLogout2")
 	notifies.expect(0)
-	b.Logout()
+	b.Logout(context.Background())
 	{
 		notifies.drain(0)
-		// BUG: the backend has already called StartLogout, and we're
-		// still logged out. So it shouldn't call it again.
-		cc.assertCalls("StartLogout", "unpause")
 		cc.assertCalls()
 		c.Assert(b.Prefs().LoggedOut(), qt.IsTrue)
 		c.Assert(b.Prefs().WantRunning(), qt.IsFalse)
 		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
 	}
 
-	// Let's acknowledge the second logout too.
-	t.Logf("\n\nLogout2 (async) - succeed")
-	notifies.expect(0)
-	cc.setAuthBlocked(true)
-	cc.send(nil, "", false, nil)
+	// A third logout should also be a no-op as the cc should be in
+	// AuthCantContinue state.
+	t.Logf("\n\nLogout3")
+	notifies.expect(3)
+	b.Logout(context.Background())
 	{
 		notifies.drain(0)
-		cc.assertCalls("unpause", "unpause")
-		c.Assert(b.Prefs().LoggedOut(), qt.IsTrue)
-		c.Assert(b.Prefs().WantRunning(), qt.IsFalse)
-		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
-	}
-
-	// Try the synchronous logout feature.
-	t.Logf("\n\nLogout3 (sync)")
-	notifies.expect(0)
-	b.LogoutSync(context.Background())
-	// NOTE: This returns as soon as cc.Logout() returns, which is okay
-	// I guess, since that's supposed to be synchronous.
-	{
-		notifies.drain(0)
-		cc.assertCalls("Logout", "unpause")
-		c.Assert(b.Prefs().LoggedOut(), qt.IsTrue)
-		c.Assert(b.Prefs().WantRunning(), qt.IsFalse)
-		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
-	}
-
-	// Generate the third logout event.
-	t.Logf("\n\nLogout3 (sync) - succeed")
-	notifies.expect(0)
-	cc.setAuthBlocked(true)
-	cc.send(nil, "", false, nil)
-	{
-		notifies.drain(0)
-		cc.assertCalls("unpause", "unpause")
+		cc.assertCalls()
 		c.Assert(b.Prefs().LoggedOut(), qt.IsTrue)
 		c.Assert(b.Prefs().WantRunning(), qt.IsFalse)
 		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
@@ -662,11 +635,12 @@ func TestStateMachine(t *testing.T) {
 	// The frontend restarts!
 	t.Logf("\n\nStart3")
 	notifies.expect(2)
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
+		previousCC.assertShutdown(false)
 		// BUG: We already called Shutdown(), no need to do it again.
 		// BUG: don't unpause because we're not logged in.
-		cc.assertCalls("Shutdown", "unpause", "New", "unpause")
+		cc.assertCalls("New")
 
 		nn := notifies.drain(2)
 		cc.assertCalls()
@@ -678,25 +652,23 @@ func TestStateMachine(t *testing.T) {
 		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
 	}
 
-	// Let's break the rules a little. Our control server accepts
-	// your invalid login attempt, with no need for an interactive login.
-	// (This simulates an admin reviving a key that you previously
-	// disabled.)
+	b.StartLoginInteractive(context.Background())
 	t.Logf("\n\nLoginFinished3")
 	notifies.expect(3)
-	cc.setAuthBlocked(false)
-	cc.persist.LoginName = "user2"
+	cc.persist.UserProfile.LoginName = "user2"
+	cc.persist.NodeID = "node2"
 	cc.send(nil, "", true, &netmap.NetworkMap{
-		MachineStatus: tailcfg.MachineAuthorized,
+		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
 	})
 	{
 		nn := notifies.drain(3)
-		cc.assertCalls("unpause", "unpause", "unpause")
+		cc.assertCalls("Login")
 		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
+		c.Assert(nn[1].Prefs.Persist(), qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
 		// Prefs after finishing the login, so LoginName updated.
-		c.Assert(nn[1].Prefs.Persist().LoginName, qt.Equals, "user2")
+		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName, qt.Equals, "user2")
 		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsFalse)
 		c.Assert(nn[1].Prefs.WantRunning(), qt.IsTrue)
 		c.Assert(ipn.Starting, qt.Equals, *nn[2].State)
@@ -722,21 +694,23 @@ func TestStateMachine(t *testing.T) {
 	// One more restart, this time with a valid key, but WantRunning=false.
 	t.Logf("\n\nStart4")
 	notifies.expect(2)
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
 		// NOTE: cc.Shutdown() is correct here, since we didn't call
 		// b.Shutdown() explicitly ourselves.
+		previousCC.assertShutdown(false)
+
 		// Note: unpause happens because ipn needs to get at least one netmap
 		//  on startup, otherwise UIs can't show the node list, login
 		//  name, etc when in state ipn.Stopped.
 		//  Arguably they shouldn't try. But they currently do.
 		nn := notifies.drain(2)
-		cc.assertCalls("Shutdown", "unpause", "New", "Login", "unpause")
+		cc.assertCalls("New", "Login")
 		c.Assert(nn[0].Prefs, qt.IsNotNil)
 		c.Assert(nn[1].State, qt.IsNotNil)
 		c.Assert(nn[0].Prefs.WantRunning(), qt.IsFalse)
 		c.Assert(nn[0].Prefs.LoggedOut(), qt.IsFalse)
-		c.Assert(ipn.Stopped, qt.Equals, *nn[1].State)
+		c.Assert(*nn[1].State, qt.Equals, ipn.Stopped)
 	}
 
 	// When logged in but !WantRunning, ipn leaves us unpaused to retrieve
@@ -751,11 +725,11 @@ func TestStateMachine(t *testing.T) {
 	t.Logf("\n\nStart4 -> netmap")
 	notifies.expect(0)
 	cc.send(nil, "", true, &netmap.NetworkMap{
-		MachineStatus: tailcfg.MachineAuthorized,
+		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
 	})
 	{
 		notifies.drain(0)
-		cc.assertCalls("pause", "pause")
+		cc.assertCalls("pause")
 	}
 
 	// Request connection.
@@ -768,7 +742,7 @@ func TestStateMachine(t *testing.T) {
 	})
 	{
 		nn := notifies.drain(2)
-		cc.assertCalls("Login", "unpause", "unpause")
+		cc.assertCalls("Login", "unpause")
 		// BUG: I would expect Prefs to change first, and state after.
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
@@ -794,12 +768,18 @@ func TestStateMachine(t *testing.T) {
 	// We want to try logging in as a different user, while Stopped.
 	// First, start the login process (without logging out first).
 	t.Logf("\n\nLoginDifferent")
-	notifies.expect(1)
-	b.StartLoginInteractive()
-	url3 := "http://localhost:1/3"
+	notifies.expect(2)
+	b.EditPrefs(&ipn.MaskedPrefs{
+		ControlURLSet: true,
+		Prefs: ipn.Prefs{
+			ControlURL: "https://localhost:1/",
+		},
+	})
+	b.StartLoginInteractive(context.Background())
+	url3 := "https://localhost:1/3"
 	cc.send(nil, url3, false, nil)
 	{
-		nn := notifies.drain(1)
+		nn := notifies.drain(2)
 		// It might seem like WantRunning should switch to true here,
 		// but that would be risky since we already have a valid
 		// user account. It might try to reconnect to the old account
@@ -807,9 +787,9 @@ func TestStateMachine(t *testing.T) {
 		//
 		// Because the login hasn't yet completed, the old login
 		// is still valid, so it's correct that we stay paused.
-		cc.assertCalls("Login", "pause", "pause")
-		c.Assert(nn[0].BrowseToURL, qt.IsNotNil)
-		c.Assert(*nn[0].BrowseToURL, qt.Equals, url3)
+		cc.assertCalls("Login")
+		c.Assert(nn[1].BrowseToURL, qt.IsNotNil)
+		c.Assert(*nn[1].BrowseToURL, qt.Equals, url3)
 	}
 
 	// Now, let's complete the interactive login, using a different
@@ -817,9 +797,10 @@ func TestStateMachine(t *testing.T) {
 	// interactive login, so we end up unpaused.
 	t.Logf("\n\nLoginDifferent URL visited")
 	notifies.expect(3)
-	cc.persist.LoginName = "user3"
+	cc.persist.UserProfile.LoginName = "user3"
+	cc.persist.NodeID = "node3"
 	cc.send(nil, "", true, &netmap.NetworkMap{
-		MachineStatus: tailcfg.MachineAuthorized,
+		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
 	})
 	{
 		nn := notifies.drain(3)
@@ -829,12 +810,12 @@ func TestStateMachine(t *testing.T) {
 		//  and !WantRunning. But since it's a fresh and successful
 		//  new login, WantRunning is true, so there was never a
 		//  reason to pause().
-		cc.assertCalls("pause", "unpause", "unpause")
+		cc.assertCalls("unpause")
 		c.Assert(nn[0].LoginFinished, qt.IsNotNil)
 		c.Assert(nn[1].Prefs, qt.IsNotNil)
 		c.Assert(nn[2].State, qt.IsNotNil)
 		// Prefs after finishing the login, so LoginName updated.
-		c.Assert(nn[1].Prefs.Persist().LoginName, qt.Equals, "user3")
+		c.Assert(nn[1].Prefs.Persist().UserProfile().LoginName, qt.Equals, "user3")
 		c.Assert(nn[1].Prefs.LoggedOut(), qt.IsFalse)
 		c.Assert(nn[1].Prefs.WantRunning(), qt.IsTrue)
 		c.Assert(ipn.Starting, qt.Equals, *nn[2].State)
@@ -844,30 +825,30 @@ func TestStateMachine(t *testing.T) {
 	// logged in and WantRunning.
 	t.Logf("\n\nStart5")
 	notifies.expect(1)
-	c.Assert(b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey}), qt.IsNil)
+	c.Assert(b.Start(ipn.Options{}), qt.IsNil)
 	{
 		// NOTE: cc.Shutdown() is correct here, since we didn't call
 		// b.Shutdown() ourselves.
-		cc.assertCalls("Shutdown", "unpause", "New", "Login", "unpause")
+		previousCC.assertShutdown(false)
+		cc.assertCalls("New", "Login")
 
 		nn := notifies.drain(1)
 		cc.assertCalls()
 		c.Assert(nn[0].Prefs, qt.IsNotNil)
 		c.Assert(nn[0].Prefs.LoggedOut(), qt.IsFalse)
 		c.Assert(nn[0].Prefs.WantRunning(), qt.IsTrue)
-		c.Assert(ipn.NoState, qt.Equals, b.State())
+		c.Assert(b.State(), qt.Equals, ipn.NoState)
 	}
 
 	// Control server accepts our valid key from before.
 	t.Logf("\n\nLoginFinished5")
 	notifies.expect(1)
-	cc.setAuthBlocked(false)
 	cc.send(nil, "", true, &netmap.NetworkMap{
-		MachineStatus: tailcfg.MachineAuthorized,
+		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
 	})
 	{
 		nn := notifies.drain(1)
-		cc.assertCalls("unpause", "unpause", "unpause")
+		cc.assertCalls()
 		// NOTE: No LoginFinished message since no interactive
 		// login was needed.
 		c.Assert(nn[0].State, qt.IsNotNil)
@@ -880,12 +861,12 @@ func TestStateMachine(t *testing.T) {
 	t.Logf("\n\nExpireKey")
 	notifies.expect(1)
 	cc.send(nil, "", false, &netmap.NetworkMap{
-		Expiry:        time.Now().Add(-time.Minute),
-		MachineStatus: tailcfg.MachineAuthorized,
+		Expiry:   time.Now().Add(-time.Minute),
+		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
 	})
 	{
 		nn := notifies.drain(1)
-		cc.assertCalls("unpause", "unpause")
+		cc.assertCalls()
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(ipn.NeedsLogin, qt.Equals, *nn[0].State)
 		c.Assert(ipn.NeedsLogin, qt.Equals, b.State())
@@ -895,12 +876,12 @@ func TestStateMachine(t *testing.T) {
 	t.Logf("\n\nExtendKey")
 	notifies.expect(1)
 	cc.send(nil, "", false, &netmap.NetworkMap{
-		Expiry:        time.Now().Add(time.Minute),
-		MachineStatus: tailcfg.MachineAuthorized,
+		Expiry:   time.Now().Add(time.Minute),
+		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
 	})
 	{
 		nn := notifies.drain(1)
-		cc.assertCalls("unpause", "unpause", "unpause")
+		cc.assertCalls()
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(ipn.Starting, qt.Equals, *nn[0].State)
 		c.Assert(ipn.Starting, qt.Equals, b.State())
@@ -911,7 +892,7 @@ func TestStateMachine(t *testing.T) {
 	b.setWgengineStatus(&wgengine.Status{DERPs: 1, AsOf: time.Now()}, nil)
 	{
 		nn := notifies.drain(1)
-		cc.assertCalls("unpause")
+		cc.assertCalls()
 		c.Assert(nn[0].State, qt.IsNotNil)
 		c.Assert(ipn.Running, qt.Equals, *nn[0].State)
 		c.Assert(ipn.Running, qt.Equals, b.State())
@@ -920,27 +901,29 @@ func TestStateMachine(t *testing.T) {
 
 func TestEditPrefsHasNoKeys(t *testing.T) {
 	logf := tstest.WhileTestRunningLogger(t)
-	store := new(testStateStorage)
-	e, err := wgengine.NewFakeUserspaceEngine(logf, 0)
+	sys := new(tsd.System)
+	sys.Set(new(mem.Store))
+	e, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set, sys.HealthTracker())
 	if err != nil {
 		t.Fatalf("NewFakeUserspaceEngine: %v", err)
 	}
 	t.Cleanup(e.Close)
+	sys.Set(e)
 
-	b, err := NewLocalBackend(logf, "logid", store, nil, e, 0)
+	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	if err != nil {
 		t.Fatalf("NewLocalBackend: %v", err)
 	}
 	b.hostinfo = &tailcfg.Hostinfo{OS: "testos"}
-	b.prefs = (&ipn.Prefs{
+	b.pm.SetPrefs((&ipn.Prefs{
 		Persist: &persist.Persist{
 			PrivateNodeKey:    key.NewNode(),
 			OldPrivateNodeKey: key.NewNode(),
 
 			LegacyFrontendPrivateMachineKey: key.NewMachine(),
 		},
-	}).View()
-	if b.prefs.Persist().PrivateNodeKey.IsZero() {
+	}).View(), ipn.NetworkProfile{})
+	if p := b.pm.CurrentPrefs().Persist(); !p.Valid() || p.PrivateNodeKey().IsZero() {
 		t.Fatalf("PrivateNodeKey not set")
 	}
 	p, err := b.EditPrefs(&ipn.MaskedPrefs{
@@ -956,19 +939,20 @@ func TestEditPrefsHasNoKeys(t *testing.T) {
 		t.Errorf("Hostname = %q; want foo", p.Hostname())
 	}
 
-	// Test that we can't see the PrivateNodeKey.
-	if !p.Persist().PrivateNodeKey.IsZero() {
-		t.Errorf("PrivateNodeKey = %v; want zero", p.Persist().PrivateNodeKey)
+	if !p.Persist().PrivateNodeKey().IsZero() {
+		t.Errorf("PrivateNodeKey = %v; want zero", p.Persist().PrivateNodeKey())
 	}
 
-	// Test that we can't see the PrivateNodeKey.
-	if !p.Persist().OldPrivateNodeKey.IsZero() {
-		t.Errorf("OldPrivateNodeKey = %v; want zero", p.Persist().OldPrivateNodeKey)
+	if !p.Persist().OldPrivateNodeKey().IsZero() {
+		t.Errorf("OldPrivateNodeKey = %v; want zero", p.Persist().OldPrivateNodeKey())
 	}
 
-	// Test that we can't see the PrivateNodeKey.
-	if !p.Persist().LegacyFrontendPrivateMachineKey.IsZero() {
-		t.Errorf("LegacyFrontendPrivateMachineKey = %v; want zero", p.Persist().LegacyFrontendPrivateMachineKey)
+	if !p.Persist().LegacyFrontendPrivateMachineKey().IsZero() {
+		t.Errorf("LegacyFrontendPrivateMachineKey = %v; want zero", p.Persist().LegacyFrontendPrivateMachineKey())
+	}
+
+	if !p.Persist().NetworkLockKey().IsZero() {
+		t.Errorf("NetworkLockKey= %v; want zero", p.Persist().NetworkLockKey())
 	}
 }
 
@@ -1002,17 +986,19 @@ func TestWGEngineStatusRace(t *testing.T) {
 	t.Skip("test fails")
 	c := qt.New(t)
 	logf := tstest.WhileTestRunningLogger(t)
-	eng, err := wgengine.NewFakeUserspaceEngine(logf, 0)
+	sys := new(tsd.System)
+	sys.Set(new(mem.Store))
+
+	eng, err := wgengine.NewFakeUserspaceEngine(logf, sys.Set)
 	c.Assert(err, qt.IsNil)
 	t.Cleanup(eng.Close)
-	b, err := NewLocalBackend(logf, "logid", new(mem.Store), nil, eng, 0)
+	sys.Set(eng)
+	b, err := NewLocalBackend(logf, logid.PublicID{}, sys, 0)
 	c.Assert(err, qt.IsNil)
 
-	cc := newMockControl(t)
+	var cc *mockControl
 	b.SetControlClientGetterForTesting(func(opts controlclient.Options) (controlclient.Client, error) {
-		cc.mu.Lock()
-		defer cc.mu.Unlock()
-		cc.logfActual = opts.Logf
+		cc = newClient(t, opts)
 		return cc, nil
 	})
 
@@ -1030,13 +1016,13 @@ func TestWGEngineStatusRace(t *testing.T) {
 	wantState(ipn.NoState)
 
 	// Start the backend.
-	err = b.Start(ipn.Options{StateKey: ipn.GlobalDaemonStateKey})
+	err = b.Start(ipn.Options{})
 	c.Assert(err, qt.IsNil)
 	wantState(ipn.NeedsLogin)
 
 	// Assert that we are logged in and authorized.
 	cc.send(nil, "", true, &netmap.NetworkMap{
-		MachineStatus: tailcfg.MachineAuthorized,
+		SelfNode: (&tailcfg.Node{MachineAuthorized: true}).View(),
 	})
 	wantState(ipn.Starting)
 
@@ -1047,7 +1033,7 @@ func TestWGEngineStatusRace(t *testing.T) {
 	// we would end up in state ipn.Running.
 	// The same should thus be true if these callbacks occur concurrently.
 	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

@@ -1,14 +1,11 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tka
 
 import (
 	"crypto/ed25519"
-	"fmt"
 	"sort"
-	"strings"
 	"testing"
 )
 
@@ -99,22 +96,6 @@ func (s *scenarioTest) mkNodeWithForks(name string, signWithDefault bool, chains
 	}
 
 	return n
-}
-
-func aumsToNames(n *scenarioNode, aums []AUM) string {
-	out := make([]string, 0, len(aums))
-outer:
-	for _, a := range aums {
-		for name, candidate := range n.AUMs {
-			if candidate.Hash() == a.Hash() {
-				out = append(out, name)
-				continue outer
-			}
-		}
-		out = append(out, fmt.Sprintf("%x", a.Hash()))
-	}
-
-	return strings.Join(out, ",")
 }
 
 func (s *scenarioTest) syncBetween(n1, n2 *scenarioNode) error {
@@ -273,7 +254,7 @@ func TestForkingPropagation(t *testing.T) {
              F1.template = removeKey1`,
 			optSignAllUsing("key2"),
 			optKey("key2", key, priv),
-			optTemplate("removeKey1", AUM{MessageKind: AUMRemoveKey, KeyID: s.defaultKey.ID()})),
+			optTemplate("removeKey1", AUM{MessageKind: AUMRemoveKey, KeyID: s.defaultKey.MustID()})),
 	})
 	s.testSyncsBetween(control, n2)
 	s.checkHaveConsensus(control, n2)
@@ -282,10 +263,10 @@ func TestForkingPropagation(t *testing.T) {
 	s.testSyncsBetween(control, n1)
 	s.checkHaveConsensus(n1, n2)
 
-	if _, err := n1.A.state.GetKey(s.defaultKey.ID()); err != ErrNoSuchKey {
+	if _, err := n1.A.state.GetKey(s.defaultKey.MustID()); err != ErrNoSuchKey {
 		t.Error("default key was still present")
 	}
-	if _, err := n1.A.state.GetKey(key.ID()); err != nil {
+	if _, err := n1.A.state.GetKey(key.MustID()); err != nil {
 		t.Errorf("key2 was not trusted: %v", err)
 	}
 }
@@ -305,7 +286,9 @@ func TestInvalidAUMPropagationRejected(t *testing.T) {
 	l3 := n1.AUMs["L3"]
 	l3H := l3.Hash()
 	l4 := AUM{MessageKind: AUMAddKey, PrevAUMHash: l3H[:]}
-	l4.sign25519(s.defaultPriv)
+	if err := l4.sign25519(s.defaultPriv); err != nil {
+		t.Fatal(err)
+	}
 	l4H := l4.Hash()
 	n1.storage.CommitVerifiedAUMs([]AUM{l4})
 	n1.A.state.LastAUMHash = &l4H
@@ -371,7 +354,9 @@ func TestBadSigAUMPropagationRejected(t *testing.T) {
 	l3 := n1.AUMs["L3"]
 	l3H := l3.Hash()
 	l4 := AUM{MessageKind: AUMNoOp, PrevAUMHash: l3H[:]}
-	l4.sign25519(s.defaultPriv)
+	if err := l4.sign25519(s.defaultPriv); err != nil {
+		t.Fatal(err)
+	}
 	l4.Signatures[0].Signature[3] = 42
 	l4H := l4.Hash()
 	n1.storage.CommitVerifiedAUMs([]AUM{l4})

@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -21,12 +20,13 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/paths"
 	"tailscale.com/version"
 )
 
 var sshCmd = &ffcli.Command{
 	Name:       "ssh",
-	ShortUsage: "ssh [user@]<host> [args...]",
+	ShortUsage: "tailscale ssh [user@]<host> [args...]",
 	ShortHelp:  "SSH to a Tailscale machine",
 	LongHelp: strings.TrimSpace(`
 
@@ -37,7 +37,7 @@ most users running the Tailscale SSH server will prefer to just use the normal
 
 The 'tailscale ssh' wrapper adds a few things:
 
-* It resolves the destination server name in its arugments using MagicDNS,
+* It resolves the destination server name in its arguments using MagicDNS,
   even if --accept-dns=false.
 * It works in userspace-networking mode, by supplying a ProxyCommand to the
   system 'ssh' command that connects via a pipe through tailscaled.
@@ -48,11 +48,11 @@ The 'tailscale ssh' wrapper adds a few things:
 }
 
 func runSSH(ctx context.Context, args []string) error {
-	if runtime.GOOS == "darwin" && version.IsSandboxedMacOS() && !envknob.UseWIPCode() {
-		return errors.New("The 'tailscale ssh' subcommand is not available on sandboxed macOS builds.\nUse the regular 'ssh' client instead.")
+	if runtime.GOOS == "darwin" && version.IsMacAppStore() && !envknob.UseWIPCode() {
+		return errors.New("The 'tailscale ssh' subcommand is not available on macOS builds distributed through the App Store or TestFlight.\nInstall the Standalone variant of Tailscale (download it from https://pkgs.tailscale.com), or use the regular 'ssh' client instead.")
 	}
 	if len(args) == 0 {
-		return errors.New("usage: ssh [user@]<host>")
+		return errors.New("usage: tailscale ssh [user@]<host>")
 	}
 	arg, argRest := args[0], args[1:]
 	username, host, ok := strings.Cut(arg, "@")
@@ -103,17 +103,21 @@ func runSSH(ctx context.Context, args []string) error {
 		"-o", fmt.Sprintf("UserKnownHostsFile %q", knownHostsFile),
 		"-o", "UpdateHostKeys no",
 		"-o", "StrictHostKeyChecking yes",
+		"-o", "CanonicalizeHostname no", // https://github.com/tailscale/tailscale/issues/10348
 	)
 
-	// TODO(bradfitz): nc is currently broken on macOS:
-	// https://github.com/tailscale/tailscale/issues/4529
-	// So don't use it for now. MagicDNS is usually working on macOS anyway
-	// and they're not in userspace mode, so 'nc' isn't very useful.
+	// MagicDNS is usually working on macOS anyway and they're not in userspace
+	// mode, so 'nc' isn't very useful.
 	if runtime.GOOS != "darwin" {
+		socketArg := ""
+		if localClient.Socket != "" && localClient.Socket != paths.DefaultTailscaledSocket() {
+			socketArg = fmt.Sprintf("--socket=%q", localClient.Socket)
+		}
+
 		argv = append(argv,
-			"-o", fmt.Sprintf("ProxyCommand %q --socket=%q nc %%h %%p",
+			"-o", fmt.Sprintf("ProxyCommand %q %s nc %%h %%p",
 				tailscaleBin,
-				rootArgs.socket,
+				socketArg,
 			))
 	}
 

@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package portmapper
 
@@ -18,7 +17,7 @@ import (
 // https://www.rfc-editor.org/rfc/pdfrfc/rfc6887.txt.pdf
 // https://tools.ietf.org/html/rfc6887
 
-//go:generate go run tailscale.com/cmd/addlicense -year 2021 -file pcpresultcode_string.go go run golang.org/x/tools/cmd/stringer -type=pcpResultCode -trimprefix=pcpCode
+//go:generate go run tailscale.com/cmd/addlicense -file pcpresultcode_string.go go run golang.org/x/tools/cmd/stringer -type=pcpResultCode -trimprefix=pcpCode
 
 type pcpResultCode uint8
 
@@ -55,13 +54,19 @@ type pcpMapping struct {
 	renewAfter time.Time
 	goodUntil  time.Time
 
-	// TODO should this also contain an epoch?
-	// Doesn't seem to be used elsewhere, but can use it for validation at some point.
+	epoch uint32
 }
 
+func (p *pcpMapping) MappingType() string      { return "pcp" }
 func (p *pcpMapping) GoodUntil() time.Time     { return p.goodUntil }
 func (p *pcpMapping) RenewAfter() time.Time    { return p.renewAfter }
 func (p *pcpMapping) External() netip.AddrPort { return p.external }
+func (p *pcpMapping) MappingDebug() string {
+	return fmt.Sprintf("pcpMapping{gw:%v, external:%v, internal:%v, renewAfter:%d, goodUntil:%d}",
+		p.gw, p.external, p.internal,
+		p.renewAfter.Unix(), p.goodUntil.Unix())
+}
+
 func (p *pcpMapping) Release(ctx context.Context) {
 	uc, err := p.c.listenPacket(ctx, "udp4", ":0")
 	if err != nil {
@@ -134,6 +139,7 @@ func parsePCPMapResponse(resp []byte) (*pcpMapping, error) {
 		external:   external,
 		renewAfter: now.Add(lifetime / 2),
 		goodUntil:  now.Add(lifetime),
+		epoch:      res.Epoch,
 	}
 
 	return mapping, nil

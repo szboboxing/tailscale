@@ -1,9 +1,7 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build darwin || freebsd
-// +build darwin freebsd
 
 package routetable
 
@@ -17,11 +15,11 @@ import (
 
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 )
 
 func TestRouteEntryFromMsg(t *testing.T) {
-	ifs := map[int]interfaces.Interface{
+	ifs := map[int]netmon.Interface{
 		1: {
 			Interface: &net.Interface{
 				Name: "iface0",

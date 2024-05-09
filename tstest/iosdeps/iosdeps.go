@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package iosdeps is a just a list of the packages we import on iOS, to let us
 // test that our transitive closure of dependencies on iOS doesn't accidentally
@@ -18,7 +17,6 @@ import (
 	_ "fmt"
 	_ "io"
 	_ "io/fs"
-	_ "io/ioutil"
 	_ "log"
 	_ "math"
 	_ "net"
@@ -35,15 +33,14 @@ import (
 	_ "time"
 	_ "unsafe"
 
+	_ "github.com/tailscale/wireguard-go/device"
+	_ "github.com/tailscale/wireguard-go/tun"
 	_ "go4.org/mem"
 	_ "golang.org/x/sys/unix"
-	_ "golang.zx2c4.com/wireguard/device"
-	_ "golang.zx2c4.com/wireguard/tun"
 	_ "tailscale.com/hostinfo"
 	_ "tailscale.com/ipn"
 	_ "tailscale.com/ipn/ipnlocal"
 	_ "tailscale.com/ipn/localapi"
-	_ "tailscale.com/log/logheap"
 	_ "tailscale.com/logtail"
 	_ "tailscale.com/logtail/filch"
 	_ "tailscale.com/net/dns"
@@ -51,7 +48,6 @@ import (
 	_ "tailscale.com/net/tsdial"
 	_ "tailscale.com/net/tstun"
 	_ "tailscale.com/paths"
-	_ "tailscale.com/tempfork/pprof"
 	_ "tailscale.com/types/empty"
 	_ "tailscale.com/types/logger"
 	_ "tailscale.com/util/clientmetric"

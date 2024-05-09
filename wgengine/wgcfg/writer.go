@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package wgcfg
 
@@ -63,7 +62,7 @@ func (cfg *Config) ToUAPI(logf logger.Logf, w io.Writer, prev *Config) error {
 		// to ensure that we're writing the full peer configuration.
 		willSetEndpoint := oldPeer.WGEndpoint != p.PublicKey || !wasPresent
 		willChangeIPs := !cidrsEqual(oldPeer.AllowedIPs, p.AllowedIPs) || !wasPresent
-		willChangeKeepalive := oldPeer.PersistentKeepalive != p.PersistentKeepalive || !wasPresent
+		willChangeKeepalive := oldPeer.PersistentKeepalive != p.PersistentKeepalive // if not wasPresent, no need to redundantly set zero (default)
 
 		if !willSetEndpoint && !willChangeIPs && !willChangeKeepalive {
 			// It's safe to skip doing anything here; wireguard-go

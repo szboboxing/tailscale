@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -18,7 +17,7 @@ var bugReportCmd = &ffcli.Command{
 	Name:       "bugreport",
 	Exec:       runBugReport,
 	ShortHelp:  "Print a shareable identifier to help diagnose issues",
-	ShortUsage: "bugreport [note]",
+	ShortUsage: "tailscale bugreport [note]",
 	FlagSet: (func() *flag.FlagSet {
 		fs := newFlagSet("bugreport")
 		fs.BoolVar(&bugReportArgs.diagnose, "diagnose", false, "run additional in-depth checks")

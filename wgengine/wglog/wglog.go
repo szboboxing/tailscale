@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package wglog contains logging helpers for wireguard-go.
 package wglog
@@ -10,7 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"golang.zx2c4.com/wireguard/device"
+	"github.com/tailscale/wireguard-go/device"
+	"tailscale.com/envknob"
 	"tailscale.com/syncs"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -36,6 +36,7 @@ type strCache struct {
 // This logger silences repetitive/unhelpful noisy log lines
 // and rewrites peer keys from wireguard-go into Tailscale format.
 func NewLogger(logf logger.Logf) *Logger {
+	const prefix = "wg: "
 	ret := new(Logger)
 	wrapper := func(format string, args ...any) {
 		if strings.Contains(format, "Routine:") && !strings.Contains(format, "receive incoming") {
@@ -50,6 +51,13 @@ func NewLogger(logf logger.Logf) *Logger {
 		if strings.Contains(format, "Interface up requested") || strings.Contains(format, "Interface down requested") {
 			// Drop. Logs 1/s constantly while the tun device is open.
 			// See https://github.com/tailscale/tailscale/issues/1388.
+			return
+		}
+		if strings.Contains(format, "Adding allowedip") {
+			// Drop. See https://github.com/tailscale/corp/issues/17532.
+			// AppConnectors (as one example) may have many subnet routes, and
+			// the messaging related to these is not specific enough to be
+			// useful.
 			return
 		}
 		replace := ret.replace.Load()
@@ -80,9 +88,12 @@ func NewLogger(logf logger.Logf) *Logger {
 		}
 		logf(format, newargs...)
 	}
+	if envknob.Bool("TS_DEBUG_RAW_WGLOG") {
+		wrapper = logf
+	}
 	ret.DeviceLogger = &device.Logger{
-		Verbosef: logger.WithPrefix(wrapper, "[v2] "),
-		Errorf:   wrapper,
+		Verbosef: logger.WithPrefix(wrapper, prefix+"[v2] "),
+		Errorf:   logger.WithPrefix(wrapper, prefix),
 	}
 	ret.strs = make(map[key.NodePublic]*strCache)
 	return ret

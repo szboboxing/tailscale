@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package derp
 
@@ -8,11 +7,13 @@ package derp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	crand "crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"expvar"
@@ -35,13 +36,17 @@ import (
 
 	"go4.org/mem"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/time/rate"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
 	"tailscale.com/metrics"
+	"tailscale.com/syncs"
+	"tailscale.com/tailcfg"
+	"tailscale.com/tstime"
+	"tailscale.com/tstime/rate"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/set"
 	"tailscale.com/version"
 )
 
@@ -62,10 +67,6 @@ func init() {
 			verboseDropKeys[k] = true
 		}
 	}
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
 }
 
 const (
@@ -122,7 +123,8 @@ type Server struct {
 	_                            align64
 	packetsForwardedOut          expvar.Int
 	packetsForwardedIn           expvar.Int
-	peerGoneFrames               expvar.Int // number of peer gone frames sent
+	peerGoneDisconnectedFrames   expvar.Int // number of peer disconnected frames sent
+	peerGoneNotHereFrames        expvar.Int // number of peer not here frames sent
 	gotPing                      expvar.Int // number of ping frames from client
 	sentPong                     expvar.Int // number of pong frames enqueued to client
 	accepts                      expvar.Int
@@ -140,15 +142,19 @@ type Server struct {
 	avgQueueDuration             *uint64          // In milliseconds; accessed atomically
 	tcpRtt                       metrics.LabelMap // histogram
 
-	// verifyClients only accepts client connections to the DERP server if the clientKey is a
-	// known peer in the network, as specified by a running tailscaled's client's local api.
-	verifyClients bool
+	// verifyClientsLocalTailscaled only accepts client connections to the DERP
+	// server if the clientKey is a known peer in the network, as specified by a
+	// running tailscaled's client's LocalAPI.
+	verifyClientsLocalTailscaled bool
+
+	verifyClientsURL         string
+	verifyClientsURLFailOpen bool
 
 	mu       sync.Mutex
 	closed   bool
 	netConns map[Conn]chan struct{} // chan is closed when conn closes
 	clients  map[key.NodePublic]clientSet
-	watchers map[*sclient]bool // mesh peer -> true
+	watchers set.Set[*sclient] // mesh peers
 	// clientsMesh tracks all clients in the cluster, both locally
 	// and to mesh peers.  If the value is nil, that means the
 	// peer is only local (and thus in the clients Map, but not
@@ -163,6 +169,8 @@ type Server struct {
 
 	// maps from netip.AddrPort to a client's public key
 	keyOfAddr map[netip.AddrPort]key.NodePublic
+
+	clock tstime.Clock
 }
 
 // clientSet represents 1 or more *sclients.
@@ -215,8 +223,7 @@ func (s singleClient) ForeachClient(f func(*sclient)) { f(s.c) }
 // All fields are guarded by Server.mu.
 type dupClientSet struct {
 	// set is the set of connected clients for sclient.key.
-	// The values are all true.
-	set map[*sclient]bool
+	set set.Set[*sclient]
 
 	// last is the most recent addition to set, or nil if the most
 	// recent one has since disconnected and nobody else has send
@@ -257,7 +264,7 @@ func (s *dupClientSet) removeClient(c *sclient) bool {
 
 	trim := s.sendHistory[:0]
 	for _, v := range s.sendHistory {
-		if s.set[v] && (len(trim) == 0 || trim[len(trim)-1] != v) {
+		if s.set.Contains(v) && (len(trim) == 0 || trim[len(trim)-1] != v) {
 			trim = append(trim, v)
 		}
 	}
@@ -279,6 +286,7 @@ func (s *dupClientSet) removeClient(c *sclient) bool {
 // public key gets more than one PacketForwarder registered for it.
 type PacketForwarder interface {
 	ForwardPacket(src, dst key.NodePublic, payload []byte) error
+	String() string
 }
 
 // Conn is the subset of the underlying net.Conn the DERP Server needs.
@@ -311,11 +319,12 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 		clientsMesh:          map[key.NodePublic]PacketForwarder{},
 		netConns:             map[Conn]chan struct{}{},
 		memSys0:              ms.Sys,
-		watchers:             map[*sclient]bool{},
+		watchers:             set.Set[*sclient]{},
 		sentTo:               map[key.NodePublic]map[key.NodePublic]int64{},
 		avgQueueDuration:     new(uint64),
 		tcpRtt:               metrics.LabelMap{Label: "le"},
 		keyOfAddr:            map[netip.AddrPort]key.NodePublic{},
+		clock:                tstime.StdClock{},
 	}
 	s.initMetacert()
 	s.packetsRecvDisco = s.packetsRecvByKind.Get("disco")
@@ -323,7 +332,8 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 	s.packetsDroppedReasonCounters = []*expvar.Int{
 		s.packetsDroppedReason.Get("unknown_dest"),
 		s.packetsDroppedReason.Get("unknown_dest_on_fwd"),
-		s.packetsDroppedReason.Get("gone"),
+		s.packetsDroppedReason.Get("gone_disconnected"),
+		s.packetsDroppedReason.Get("gone_not_here"),
 		s.packetsDroppedReason.Get("queue_head"),
 		s.packetsDroppedReason.Get("queue_tail"),
 		s.packetsDroppedReason.Get("write_error"),
@@ -345,7 +355,20 @@ func (s *Server) SetMeshKey(v string) {
 //
 // It must be called before serving begins.
 func (s *Server) SetVerifyClient(v bool) {
-	s.verifyClients = v
+	s.verifyClientsLocalTailscaled = v
+}
+
+// SetVerifyClientURL sets the admission controller URL to use for verifying clients.
+// If empty, all clients are accepted (unless restricted by SetVerifyClient checking
+// against tailscaled).
+func (s *Server) SetVerifyClientURL(v string) {
+	s.verifyClientsURL = v
+}
+
+// SetVerifyClientURLFailOpen sets whether to allow clients to connect if the
+// admission controller URL is unreachable.
+func (s *Server) SetVerifyClientURLFailOpen(v bool) {
+	s.verifyClientsURLFailOpen = v
 }
 
 // HasMeshKey reports whether the server is configured with a mesh key.
@@ -464,8 +487,8 @@ func (s *Server) initMetacert() {
 			CommonName: fmt.Sprintf("derpkey%s", s.publicKey.UntypedHexString()),
 		},
 		// Windows requires NotAfter and NotBefore set:
-		NotAfter:  time.Now().Add(30 * 24 * time.Hour),
-		NotBefore: time.Now().Add(-30 * 24 * time.Hour),
+		NotAfter:  s.clock.Now().Add(30 * 24 * time.Hour),
+		NotBefore: s.clock.Now().Add(-30 * 24 * time.Hour),
 		// Per https://github.com/golang/go/issues/51759#issuecomment-1071147836,
 		// macOS requires BasicConstraints when subject == issuer:
 		BasicConstraintsValid: true,
@@ -491,32 +514,35 @@ func (s *Server) registerClient(c *sclient) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	set := s.clients[c.key]
-	switch set := set.(type) {
+	curSet := s.clients[c.key]
+	switch curSet := curSet.(type) {
 	case nil:
 		s.clients[c.key] = singleClient{c}
+		c.debugLogf("register single client")
 	case singleClient:
 		s.dupClientKeys.Add(1)
 		s.dupClientConns.Add(2) // both old and new count
 		s.dupClientConnTotal.Add(1)
-		old := set.ActiveClient()
+		old := curSet.ActiveClient()
 		old.isDup.Store(true)
 		c.isDup.Store(true)
 		s.clients[c.key] = &dupClientSet{
 			last: c,
-			set: map[*sclient]bool{
-				old: true,
-				c:   true,
+			set: set.Set[*sclient]{
+				old: struct{}{},
+				c:   struct{}{},
 			},
 			sendHistory: []*sclient{old},
 		}
+		c.debugLogf("register duplicate client")
 	case *dupClientSet:
 		s.dupClientConns.Add(1)     // the gauge
 		s.dupClientConnTotal.Add(1) // the counter
 		c.isDup.Store(true)
-		set.set[c] = true
-		set.last = c
-		set.sendHistory = append(set.sendHistory, c)
+		curSet.set.Add(c)
+		curSet.last = c
+		curSet.sendHistory = append(curSet.sendHistory, c)
+		c.debugLogf("register another duplicate client")
 	}
 
 	if _, ok := s.clientsMesh[c.key]; !ok {
@@ -524,7 +550,7 @@ func (s *Server) registerClient(c *sclient) {
 	}
 	s.keyOfAddr[c.remoteIPPort] = c.key
 	s.curClients.Add(1)
-	s.broadcastPeerStateChangeLocked(c.key, true)
+	s.broadcastPeerStateChangeLocked(c.key, c.remoteIPPort, true)
 }
 
 // broadcastPeerStateChangeLocked enqueues a message to all watchers
@@ -532,9 +558,13 @@ func (s *Server) registerClient(c *sclient) {
 // presence changed.
 //
 // s.mu must be held.
-func (s *Server) broadcastPeerStateChangeLocked(peer key.NodePublic, present bool) {
+func (s *Server) broadcastPeerStateChangeLocked(peer key.NodePublic, ipPort netip.AddrPort, present bool) {
 	for w := range s.watchers {
-		w.peerStateChange = append(w.peerStateChange, peerConnState{peer: peer, present: present})
+		w.peerStateChange = append(w.peerStateChange, peerConnState{
+			peer:    peer,
+			present: present,
+			ipPort:  ipPort,
+		})
 		go w.requestMeshUpdate()
 	}
 }
@@ -549,14 +579,15 @@ func (s *Server) unregisterClient(c *sclient) {
 	case nil:
 		c.logf("[unexpected]; clients map is empty")
 	case singleClient:
-		c.logf("removing connection")
+		c.debugLogf("removed connection")
 		delete(s.clients, c.key)
 		if v, ok := s.clientsMesh[c.key]; ok && v == nil {
 			delete(s.clientsMesh, c.key)
 			s.notePeerGoneFromRegionLocked(c.key)
 		}
-		s.broadcastPeerStateChangeLocked(c.key, false)
+		s.broadcastPeerStateChangeLocked(c.key, netip.AddrPort{}, false)
 	case *dupClientSet:
+		c.debugLogf("removed duplicate client")
 		if set.removeClient(c) {
 			s.dupClientConns.Add(-1)
 		} else {
@@ -610,11 +641,24 @@ func (s *Server) notePeerGoneFromRegionLocked(key key.NodePublic) {
 		}
 		set.ForeachClient(func(peer *sclient) {
 			if peer.connNum == connNum {
-				go peer.requestPeerGoneWrite(key)
+				go peer.requestPeerGoneWrite(key, PeerGoneReasonDisconnected)
 			}
 		})
 	}
 	delete(s.sentTo, key)
+}
+
+// requestPeerGoneWriteLimited sends a request to write a "peer gone"
+// frame, but only in reply to a disco packet, and only if we haven't
+// sent one recently.
+func (c *sclient) requestPeerGoneWriteLimited(peer key.NodePublic, contents []byte, reason PeerGoneReasonType) {
+	if disco.LooksLikeDiscoWrapper(contents) != true {
+		return
+	}
+
+	if c.peerGoneLim.Allow() {
+		go c.requestPeerGoneWrite(peer, reason)
+	}
 }
 
 func (s *Server) addWatcher(c *sclient) {
@@ -631,13 +675,21 @@ func (s *Server) addWatcher(c *sclient) {
 	defer s.mu.Unlock()
 
 	// Queue messages for each already-connected client.
-	for peer := range s.clients {
-		c.peerStateChange = append(c.peerStateChange, peerConnState{peer: peer, present: true})
+	for peer, clientSet := range s.clients {
+		ac := clientSet.ActiveClient()
+		if ac == nil {
+			continue
+		}
+		c.peerStateChange = append(c.peerStateChange, peerConnState{
+			peer:    peer,
+			present: true,
+			ipPort:  ac.remoteIPPort,
+		})
 	}
 
 	// And enroll the watcher in future updates (of both
 	// connections & disconnections).
-	s.watchers[c] = true
+	s.watchers.Add(c)
 
 	go c.requestMeshUpdate()
 }
@@ -654,7 +706,9 @@ func (s *Server) accept(ctx context.Context, nc Conn, brw *bufio.ReadWriter, rem
 	if err != nil {
 		return fmt.Errorf("receive client key: %v", err)
 	}
-	if err := s.verifyClient(clientKey, clientInfo); err != nil {
+
+	clientAP, _ := netip.ParseAddrPort(remoteAddr)
+	if err := s.verifyClient(ctx, clientKey, clientInfo, clientAP.Addr()); err != nil {
 		return fmt.Errorf("client %x rejected: %v", clientKey, err)
 	}
 
@@ -673,16 +727,16 @@ func (s *Server) accept(ctx context.Context, nc Conn, brw *bufio.ReadWriter, rem
 		nc:             nc,
 		br:             br,
 		bw:             bw,
-		logf:           logger.WithPrefix(s.logf, fmt.Sprintf("derp client %v/%x: ", remoteAddr, clientKey)),
+		logf:           logger.WithPrefix(s.logf, fmt.Sprintf("derp client %v%s: ", remoteAddr, clientKey.ShortString())),
 		done:           ctx.Done(),
-		remoteAddr:     remoteAddr,
 		remoteIPPort:   remoteIPPort,
-		connectedAt:    time.Now(),
+		connectedAt:    s.clock.Now(),
 		sendQueue:      make(chan pkt, perClientSendQueueDepth),
 		discoSendQueue: make(chan pkt, perClientSendQueueDepth),
 		sendPongCh:     make(chan [8]byte, 1),
-		peerGone:       make(chan key.NodePublic),
+		peerGone:       make(chan peerGoneMsg),
 		canMesh:        clientInfo.MeshKey != "" && clientInfo.MeshKey == s.meshKey,
+		peerGoneLim:    rate.NewLimiter(rate.Every(time.Second), 3),
 	}
 
 	if c.canMesh {
@@ -690,6 +744,12 @@ func (s *Server) accept(ctx context.Context, nc Conn, brw *bufio.ReadWriter, rem
 	}
 	if clientInfo != nil {
 		c.info = *clientInfo
+		if envknob.Bool("DERP_PROBER_DEBUG_LOGS") && clientInfo.IsProber {
+			c.debug = true
+		}
+	}
+	if s.debug {
+		c.debug = true
 	}
 
 	s.registerClient(c)
@@ -703,11 +763,11 @@ func (s *Server) accept(ctx context.Context, nc Conn, brw *bufio.ReadWriter, rem
 	return c.run(ctx)
 }
 
-// for testing
-var (
-	timeSleep = time.Sleep
-	timeNow   = time.Now
-)
+func (s *Server) debugLogf(format string, v ...any) {
+	if s.debug {
+		s.logf(format, v...)
+	}
+}
 
 // run serves the client until there's an error.
 // If the client hangs up or the server is closed, run returns nil, otherwise run returns an error.
@@ -720,22 +780,27 @@ func (c *sclient) run(ctx context.Context) error {
 	defer func() {
 		cancelSender()
 		if err := grp.Wait(); err != nil && !c.s.isClosed() {
-			c.logf("sender failed: %v", err)
+			if errors.Is(err, context.Canceled) {
+				c.debugLogf("sender canceled by reader exiting")
+			} else {
+				c.logf("sender failed: %v", err)
+			}
 		}
 	}()
 
 	for {
 		ft, fl, err := readFrameHeader(c.br)
+		c.debugLogf("read frame type %d len %d err %v", ft, fl, err)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
-				c.logf("read EOF")
+				c.debugLogf("read EOF")
 				return nil
 			}
 			if c.s.isClosed() {
 				c.logf("closing; server closed")
 				return nil
 			}
-			return fmt.Errorf("client %x: readFrameHeader: %w", c.key, err)
+			return fmt.Errorf("client %s: readFrameHeader: %w", c.key.ShortString(), err)
 		}
 		c.s.noteClientActivity(c)
 		switch ft {
@@ -878,14 +943,18 @@ func (c *sclient) handleFrameForwardPacket(ft frameType, fl uint32) error {
 		reason := dropReasonUnknownDestOnFwd
 		if dstLen > 1 {
 			reason = dropReasonDupClient
+		} else {
+			c.requestPeerGoneWriteLimited(dstKey, contents, PeerGoneReasonNotHere)
 		}
 		s.recordDrop(contents, srcKey, dstKey, reason)
 		return nil
 	}
 
+	dst.debugLogf("received forwarded packet from %s via %s", srcKey.ShortString(), c.key.ShortString())
+
 	return c.sendPkt(dst, pkt{
 		bs:         contents,
-		enqueuedAt: time.Now(),
+		enqueuedAt: c.s.clock.Now(),
 		src:        srcKey,
 	})
 }
@@ -930,7 +999,9 @@ func (c *sclient) handleFrameSendPacket(ft frameType, fl uint32) error {
 	if dst == nil {
 		if fwd != nil {
 			s.packetsForwardedOut.Add(1)
-			if err := fwd.ForwardPacket(c.key, dstKey, contents); err != nil {
+			err := fwd.ForwardPacket(c.key, dstKey, contents)
+			c.debugLogf("SendPacket for %s, forwarding via %s: %v", dstKey.ShortString(), fwd, err)
+			if err != nil {
 				// TODO:
 				return nil
 			}
@@ -939,28 +1010,38 @@ func (c *sclient) handleFrameSendPacket(ft frameType, fl uint32) error {
 		reason := dropReasonUnknownDest
 		if dstLen > 1 {
 			reason = dropReasonDupClient
+		} else {
+			c.requestPeerGoneWriteLimited(dstKey, contents, PeerGoneReasonNotHere)
 		}
 		s.recordDrop(contents, c.key, dstKey, reason)
+		c.debugLogf("SendPacket for %s, dropping with reason=%s", dstKey.ShortString(), reason)
 		return nil
 	}
+	c.debugLogf("SendPacket for %s, sending directly", dstKey.ShortString())
 
 	p := pkt{
 		bs:         contents,
-		enqueuedAt: time.Now(),
+		enqueuedAt: c.s.clock.Now(),
 		src:        c.key,
 	}
 	return c.sendPkt(dst, p)
 }
 
+func (c *sclient) debugLogf(format string, v ...any) {
+	if c.debug {
+		c.logf(format, v...)
+	}
+}
+
 // dropReason is why we dropped a DERP frame.
 type dropReason int
 
-//go:generate go run tailscale.com/cmd/addlicense -year 2021 -file dropreason_string.go go run golang.org/x/tools/cmd/stringer -type=dropReason -trimprefix=dropReason
+//go:generate go run tailscale.com/cmd/addlicense -file dropreason_string.go go run golang.org/x/tools/cmd/stringer -type=dropReason -trimprefix=dropReason
 
 const (
 	dropReasonUnknownDest      dropReason = iota // unknown destination pubkey
 	dropReasonUnknownDestOnFwd                   // unknown destination pubkey on a derp-forwarded packet
-	dropReasonGone                               // destination tailscaled disconnected before we could send
+	dropReasonGoneDisconnected                   // destination tailscaled disconnected before we could send
 	dropReasonQueueHead                          // destination queue is full, dropped packet at queue head
 	dropReasonQueueTail                          // destination queue is full, dropped packet at queue tail
 	dropReasonWriteError                         // OS write() failed
@@ -970,7 +1051,8 @@ const (
 func (s *Server) recordDrop(packetBytes []byte, srcKey, dstKey key.NodePublic, reason dropReason) {
 	s.packetsDropped.Add(1)
 	s.packetsDroppedReasonCounters[reason].Add(1)
-	if disco.LooksLikeDiscoWrapper(packetBytes) {
+	looksDisco := disco.LooksLikeDiscoWrapper(packetBytes)
+	if looksDisco {
 		s.packetsDroppedTypeDisco.Add(1)
 	} else {
 		s.packetsDroppedTypeOther.Add(1)
@@ -983,9 +1065,7 @@ func (s *Server) recordDrop(packetBytes []byte, srcKey, dstKey key.NodePublic, r
 		msg := fmt.Sprintf("drop (%s) %s -> %s", srcKey.ShortString(), reason, dstKey.ShortString())
 		s.limitedLogf(msg)
 	}
-	if s.debug {
-		s.logf("dropping packet reason=%s dst=%s disco=%v", reason, dstKey, disco.LooksLikeDiscoWrapper(packetBytes))
-	}
+	s.debugLogf("dropping packet reason=%s dst=%s disco=%v", reason, dstKey, looksDisco)
 }
 
 func (c *sclient) sendPkt(dst *sclient, p pkt) error {
@@ -1002,12 +1082,14 @@ func (c *sclient) sendPkt(dst *sclient, p pkt) error {
 	for attempt := 0; attempt < 3; attempt++ {
 		select {
 		case <-dst.done:
-			s.recordDrop(p.bs, c.key, dstKey, dropReasonGone)
+			s.recordDrop(p.bs, c.key, dstKey, dropReasonGoneDisconnected)
+			dst.debugLogf("sendPkt attempt %d dropped, dst gone", attempt)
 			return nil
 		default:
 		}
 		select {
 		case sendQueue <- p:
+			dst.debugLogf("sendPkt attempt %d enqueued", attempt)
 			return nil
 		default:
 		}
@@ -1023,16 +1105,20 @@ func (c *sclient) sendPkt(dst *sclient, p pkt) error {
 	// contended queue with racing writers. Give up and tail-drop in
 	// this case to keep reader unblocked.
 	s.recordDrop(p.bs, c.key, dstKey, dropReasonQueueTail)
+	dst.debugLogf("sendPkt attempt %d dropped, queue full")
 
 	return nil
 }
 
 // requestPeerGoneWrite sends a request to write a "peer gone" frame
-// that the provided peer has disconnected. It blocks until either the
+// with an explanation of why it is gone. It blocks until either the
 // write request is scheduled, or the client has closed.
-func (c *sclient) requestPeerGoneWrite(peer key.NodePublic) {
+func (c *sclient) requestPeerGoneWrite(peer key.NodePublic, reason PeerGoneReasonType) {
 	select {
-	case c.peerGone <- peer:
+	case c.peerGone <- peerGoneMsg{
+		peer:   peer,
+		reason: reason,
+	}:
 	case <-c.done:
 	}
 }
@@ -1047,21 +1133,60 @@ func (c *sclient) requestMeshUpdate() {
 	}
 }
 
-func (s *Server) verifyClient(clientKey key.NodePublic, info *clientInfo) error {
-	if !s.verifyClients {
-		return nil
+// verifyClient checks whether the client is allowed to connect to the derper,
+// depending on how & whether the server's been configured to verify.
+func (s *Server) verifyClient(ctx context.Context, clientKey key.NodePublic, info *clientInfo, clientIP netip.Addr) error {
+	// tailscaled-based verification:
+	if s.verifyClientsLocalTailscaled {
+		status, err := tailscale.Status(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to query local tailscaled status: %w", err)
+		}
+		if clientKey == status.Self.PublicKey {
+			return nil
+		}
+		if _, exists := status.Peer[clientKey]; !exists {
+			return fmt.Errorf("client %v not in set of peers", clientKey)
+		}
 	}
-	status, err := tailscale.Status(context.TODO())
-	if err != nil {
-		return fmt.Errorf("failed to query local tailscaled status: %w", err)
+
+	// admission controller-based verification:
+	if s.verifyClientsURL != "" {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		jreq, err := json.Marshal(&tailcfg.DERPAdmitClientRequest{
+			NodePublic: clientKey,
+			Source:     clientIP,
+		})
+		if err != nil {
+			return err
+		}
+		req, err := http.NewRequestWithContext(ctx, "POST", s.verifyClientsURL, bytes.NewReader(jreq))
+		if err != nil {
+			return err
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			if s.verifyClientsURLFailOpen {
+				s.logf("admission controller unreachable; allowing client %v", clientKey)
+				return nil
+			}
+			return err
+		}
+		defer res.Body.Close()
+		if res.StatusCode != 200 {
+			return fmt.Errorf("admission controller: %v", res.Status)
+		}
+		var jres tailcfg.DERPAdmitClientResponse
+		if err := json.NewDecoder(io.LimitReader(res.Body, 4<<10)).Decode(&jres); err != nil {
+			return err
+		}
+		if !jres.Allow {
+			return fmt.Errorf("admission controller: %v/%v not allowed", clientKey, clientIP)
+		}
+		// TODO(bradfitz): add policy for configurable bandwidth rate per client?
 	}
-	if clientKey == status.Self.PublicKey {
-		return nil
-	}
-	if _, exists := status.Peer[clientKey]; !exists {
-		return fmt.Errorf("client %v not in set of peers", clientKey)
-	}
-	// TODO(bradfitz): add policy for configurable bandwidth rate per client?
 	return nil
 }
 
@@ -1246,22 +1371,17 @@ type sclient struct {
 	key            key.NodePublic
 	info           clientInfo
 	logf           logger.Logf
-	done           <-chan struct{}     // closed when connection closes
-	remoteAddr     string              // usually ip:port from net.Conn.RemoteAddr().String()
-	remoteIPPort   netip.AddrPort      // zero if remoteAddr is not ip:port.
-	sendQueue      chan pkt            // packets queued to this client; never closed
-	discoSendQueue chan pkt            // important packets queued to this client; never closed
-	sendPongCh     chan [8]byte        // pong replies to send to the client; never closed
-	peerGone       chan key.NodePublic // write request that a previous sender has disconnected (not used by mesh peers)
-	meshUpdate     chan struct{}       // write request to write peerStateChange
-	canMesh        bool                // clientInfo had correct mesh token for inter-region routing
-	isDup          atomic.Bool         // whether more than 1 sclient for key is connected
-	isDisabled     atomic.Bool         // whether sends to this peer are disabled due to active/active dups
-
-	// replaceLimiter controls how quickly two connections with
-	// the same client key can kick each other off the server by
-	// taking over ownership of a key.
-	replaceLimiter *rate.Limiter
+	done           <-chan struct{}  // closed when connection closes
+	remoteIPPort   netip.AddrPort   // zero if remoteAddr is not ip:port.
+	sendQueue      chan pkt         // packets queued to this client; never closed
+	discoSendQueue chan pkt         // important packets queued to this client; never closed
+	sendPongCh     chan [8]byte     // pong replies to send to the client; never closed
+	peerGone       chan peerGoneMsg // write request that a peer is not at this server (not used by mesh peers)
+	meshUpdate     chan struct{}    // write request to write peerStateChange
+	canMesh        bool             // clientInfo had correct mesh token for inter-region routing
+	isDup          atomic.Bool      // whether more than 1 sclient for key is connected
+	isDisabled     atomic.Bool      // whether sends to this peer are disabled due to active/active dups
+	debug          bool             // turn on for verbose logging
 
 	// Owned by run, not thread-safe.
 	br          *bufio.Reader
@@ -1278,20 +1398,23 @@ type sclient struct {
 	// the client for them to update their map of who's connected
 	// to this node.
 	peerStateChange []peerConnState
+
+	// peerGoneLimiter limits how often the server will inform a
+	// client that it's trying to establish a direct connection
+	// through us with a peer we have no record of.
+	peerGoneLim *rate.Limiter
 }
 
 // peerConnState represents whether a peer is connected to the server
 // or not.
 type peerConnState struct {
+	ipPort  netip.AddrPort // if present, the peer's IP:port
 	peer    key.NodePublic
 	present bool
 }
 
 // pkt is a request to write a data frame to an sclient.
 type pkt struct {
-	// src is the who's the sender of the packet.
-	src key.NodePublic
-
 	// enqueuedAt is when a packet was put onto a queue before it was sent,
 	// and is used for reporting metrics on the duration of packets in the queue.
 	enqueuedAt time.Time
@@ -1299,6 +1422,15 @@ type pkt struct {
 	// bs is the data packet bytes.
 	// The memory is owned by pkt.
 	bs []byte
+
+	// src is the who's the sender of the packet.
+	src key.NodePublic
+}
+
+// peerGoneMsg is a request to write a peerGone frame to an sclient
+type peerGoneMsg struct {
+	peer   key.NodePublic
+	reason PeerGoneReasonType
 }
 
 func (c *sclient) setPreferred(v bool) {
@@ -1321,7 +1453,7 @@ func (c *sclient) setPreferred(v bool) {
 	// graphs, so not important to miss a move. But it shouldn't:
 	// the netcheck/re-STUNs in magicsock only happen about every
 	// 30 seconds.
-	if time.Since(c.connectedAt) > 5*time.Second {
+	if c.s.clock.Since(c.connectedAt) > 5*time.Second {
 		homeMove.Add(1)
 	}
 }
@@ -1335,7 +1467,7 @@ func expMovingAverage(prev, newValue, alpha float64) float64 {
 
 // recordQueueTime updates the average queue duration metric after a packet has been sent.
 func (c *sclient) recordQueueTime(enqueuedAt time.Time) {
-	elapsed := float64(time.Since(enqueuedAt).Milliseconds())
+	elapsed := float64(c.s.clock.Since(enqueuedAt).Milliseconds())
 	for {
 		old := atomic.LoadUint64(c.s.avgQueueDuration)
 		newAvg := expMovingAverage(math.Float64frombits(old), elapsed, 0.1)
@@ -1355,9 +1487,9 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 		for {
 			select {
 			case pkt := <-c.sendQueue:
-				c.s.recordDrop(pkt.bs, pkt.src, c.key, dropReasonGone)
+				c.s.recordDrop(pkt.bs, pkt.src, c.key, dropReasonGoneDisconnected)
 			case pkt := <-c.discoSendQueue:
-				c.s.recordDrop(pkt.bs, pkt.src, c.key, dropReasonGone)
+				c.s.recordDrop(pkt.bs, pkt.src, c.key, dropReasonGoneDisconnected)
 			default:
 				return
 			}
@@ -1365,7 +1497,7 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 	}()
 
 	jitter := time.Duration(rand.Intn(5000)) * time.Millisecond
-	keepAliveTick := time.NewTicker(keepAlive + jitter)
+	keepAliveTick, keepAliveTickChannel := c.s.clock.NewTicker(keepAlive + jitter)
 	defer keepAliveTick.Stop()
 
 	var werr error // last write error
@@ -1378,8 +1510,8 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case peer := <-c.peerGone:
-			werr = c.sendPeerGone(peer)
+		case msg := <-c.peerGone:
+			werr = c.sendPeerGone(msg.peer, msg.reason)
 			continue
 		case <-c.meshUpdate:
 			werr = c.sendMeshUpdates()
@@ -1395,7 +1527,7 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 		case msg := <-c.sendPongCh:
 			werr = c.sendPong(msg)
 			continue
-		case <-keepAliveTick.C:
+		case <-keepAliveTickChannel:
 			werr = c.sendKeepAlive()
 			continue
 		default:
@@ -1410,8 +1542,8 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case peer := <-c.peerGone:
-			werr = c.sendPeerGone(peer)
+		case msg := <-c.peerGone:
+			werr = c.sendPeerGone(msg.peer, msg.reason)
 		case <-c.meshUpdate:
 			werr = c.sendMeshUpdates()
 			continue
@@ -1424,7 +1556,7 @@ func (c *sclient) sendLoop(ctx context.Context) error {
 		case msg := <-c.sendPongCh:
 			werr = c.sendPong(msg)
 			continue
-		case <-keepAliveTick.C:
+		case <-keepAliveTickChannel:
 			werr = c.sendKeepAlive()
 		}
 	}
@@ -1452,23 +1584,38 @@ func (c *sclient) sendPong(data [8]byte) error {
 }
 
 // sendPeerGone sends a peerGone frame, without flushing.
-func (c *sclient) sendPeerGone(peer key.NodePublic) error {
-	c.s.peerGoneFrames.Add(1)
+func (c *sclient) sendPeerGone(peer key.NodePublic, reason PeerGoneReasonType) error {
+	switch reason {
+	case PeerGoneReasonDisconnected:
+		c.s.peerGoneDisconnectedFrames.Add(1)
+	case PeerGoneReasonNotHere:
+		c.s.peerGoneNotHereFrames.Add(1)
+	}
 	c.setWriteDeadline()
-	if err := writeFrameHeader(c.bw.bw(), framePeerGone, keyLen); err != nil {
+	data := make([]byte, 0, keyLen+1)
+	data = peer.AppendTo(data)
+	data = append(data, byte(reason))
+	if err := writeFrameHeader(c.bw.bw(), framePeerGone, uint32(len(data))); err != nil {
 		return err
 	}
-	_, err := c.bw.Write(peer.AppendTo(nil))
+
+	_, err := c.bw.Write(data)
 	return err
 }
 
 // sendPeerPresent sends a peerPresent frame, without flushing.
-func (c *sclient) sendPeerPresent(peer key.NodePublic) error {
+func (c *sclient) sendPeerPresent(peer key.NodePublic, ipPort netip.AddrPort) error {
 	c.setWriteDeadline()
-	if err := writeFrameHeader(c.bw.bw(), framePeerPresent, keyLen); err != nil {
+	const frameLen = keyLen + 16 + 2
+	if err := writeFrameHeader(c.bw.bw(), framePeerPresent, frameLen); err != nil {
 		return err
 	}
-	_, err := c.bw.Write(peer.AppendTo(nil))
+	payload := make([]byte, frameLen)
+	_ = peer.AppendTo(payload[:0])
+	a16 := ipPort.Addr().As16()
+	copy(payload[keyLen:], a16[:])
+	binary.BigEndian.PutUint16(payload[keyLen+16:], ipPort.Port())
+	_, err := c.bw.Write(payload)
 	return err
 }
 
@@ -1480,6 +1627,17 @@ func (c *sclient) sendMeshUpdates() error {
 	c.s.mu.Lock()
 	defer c.s.mu.Unlock()
 
+	// allow all happened-before mesh update request goroutines to complete, if
+	// we don't finish the task we'll queue another below.
+drainUpdates:
+	for {
+		select {
+		case <-c.meshUpdate:
+		default:
+			break drainUpdates
+		}
+	}
+
 	writes := 0
 	for _, pcs := range c.peerStateChange {
 		if c.bw.Available() <= frameHeaderLen+keyLen {
@@ -1487,9 +1645,9 @@ func (c *sclient) sendMeshUpdates() error {
 		}
 		var err error
 		if pcs.present {
-			err = c.sendPeerPresent(pcs.peer)
+			err = c.sendPeerPresent(pcs.peer, pcs.ipPort)
 		} else {
-			err = c.sendPeerGone(pcs.peer)
+			err = c.sendPeerGone(pcs.peer, PeerGoneReasonDisconnected)
 		}
 		if err != nil {
 			// Shouldn't happen, though, as we're writing
@@ -1529,6 +1687,7 @@ func (c *sclient) sendPacket(srcKey key.NodePublic, contents []byte) (err error)
 			c.s.packetsSent.Add(1)
 			c.s.bytesSent.Add(int64(len(contents)))
 		}
+		c.debugLogf("sendPacket from %s: %v", srcKey.ShortString(), err)
 	}()
 
 	c.setWriteDeadline()
@@ -1560,22 +1719,20 @@ func (s *Server) AddPacketForwarder(dst key.NodePublic, fwd PacketForwarder) {
 			// Duplicate registration of same forwarder. Ignore.
 			return
 		}
-		if m, ok := prev.(multiForwarder); ok {
-			if _, ok := m[fwd]; ok {
+		if m, ok := prev.(*multiForwarder); ok {
+			if _, ok := m.all[fwd]; ok {
 				// Duplicate registration of same forwarder in set; ignore.
 				return
 			}
-			m[fwd] = m.maxVal() + 1
+			m.add(fwd)
 			return
 		}
 		if prev != nil {
 			// Otherwise, the existing value is not a set,
 			// not a dup, and not local-only (nil) so make
-			// it a set.
-			fwd = multiForwarder{
-				prev: 1, // existed 1st, higher priority
-				fwd:  2, // the passed in fwd is in 2nd place
-			}
+			// it a set. `prev` existed first, so will have higher
+			// priority.
+			fwd = newMultiForwarder(prev, fwd)
 			s.multiForwarderCreated.Add(1)
 		}
 	}
@@ -1591,19 +1748,14 @@ func (s *Server) RemovePacketForwarder(dst key.NodePublic, fwd PacketForwarder) 
 	if !ok {
 		return
 	}
-	if m, ok := v.(multiForwarder); ok {
-		if len(m) < 2 {
+	if m, ok := v.(*multiForwarder); ok {
+		if len(m.all) < 2 {
 			panic("unexpected")
 		}
-		delete(m, fwd)
-		// If fwd was in m and we no longer need to be a
-		// multiForwarder, replace the entry with the
-		// remaining PacketForwarder.
-		if len(m) == 1 {
-			var remain PacketForwarder
-			for k := range m {
-				remain = k
-			}
+		if remain, isLast := m.deleteLocked(fwd); isLast {
+			// If fwd was in m and we no longer need to be a
+			// multiForwarder, replace the entry with the
+			// remaining PacketForwarder.
 			s.clientsMesh[dst] = remain
 			s.multiForwarderDeleted.Add(1)
 		}
@@ -1635,27 +1787,69 @@ func (s *Server) RemovePacketForwarder(dst key.NodePublic, fwd PacketForwarder) 
 // client is. The map value is unique connection number; the lowest
 // one has been seen the longest. It's used to make sure we forward
 // packets consistently to the same node and don't pick randomly.
-type multiForwarder map[PacketForwarder]uint8
+type multiForwarder struct {
+	fwd syncs.AtomicValue[PacketForwarder] // preferred forwarder.
+	all map[PacketForwarder]uint8          // all forwarders, protected by s.mu.
+}
 
-func (m multiForwarder) maxVal() (max uint8) {
-	for _, v := range m {
+// newMultiForwarder creates a new multiForwarder.
+// The first PacketForwarder passed to this function will be the preferred one.
+func newMultiForwarder(fwds ...PacketForwarder) *multiForwarder {
+	f := &multiForwarder{all: make(map[PacketForwarder]uint8)}
+	f.fwd.Store(fwds[0])
+	for idx, fwd := range fwds {
+		f.all[fwd] = uint8(idx)
+	}
+	return f
+}
+
+// add adds a new forwarder to the map with a connection number that
+// is higher than the existing ones.
+func (f *multiForwarder) add(fwd PacketForwarder) {
+	var max uint8
+	for _, v := range f.all {
 		if v > max {
 			max = v
 		}
 	}
-	return
+	f.all[fwd] = max + 1
 }
 
-func (m multiForwarder) ForwardPacket(src, dst key.NodePublic, payload []byte) error {
-	var fwd PacketForwarder
-	var lowest uint8
-	for k, v := range m {
-		if fwd == nil || v < lowest {
-			fwd = k
-			lowest = v
+// deleteLocked removes a packet forwarder from the map. It expects Server.mu to be held.
+// If only one forwarder remains after the removal, it will be returned alongside a `true` boolean value.
+func (f *multiForwarder) deleteLocked(fwd PacketForwarder) (_ PacketForwarder, isLast bool) {
+	delete(f.all, fwd)
+
+	if fwd == f.fwd.Load() {
+		// The preferred forwarder has been removed, choose a new one
+		// based on the lowest index.
+		var lowestfwd PacketForwarder
+		var lowest uint8
+		for k, v := range f.all {
+			if lowestfwd == nil || v < lowest {
+				lowestfwd = k
+				lowest = v
+			}
+		}
+		if lowestfwd != nil {
+			f.fwd.Store(lowestfwd)
 		}
 	}
-	return fwd.ForwardPacket(src, dst, payload)
+
+	if len(f.all) == 1 {
+		for k := range f.all {
+			return k, true
+		}
+	}
+	return nil, false
+}
+
+func (f *multiForwarder) ForwardPacket(src, dst key.NodePublic, payload []byte) error {
+	return f.fwd.Load().ForwardPacket(src, dst, payload)
+}
+
+func (f *multiForwarder) String() string {
+	return fmt.Sprintf("<MultiForwarder fwd=%s total=%d>", f.fwd.Load(), len(f.all))
 }
 
 func (s *Server) expVarFunc(f func() any) expvar.Func {
@@ -1694,7 +1888,8 @@ func (s *Server) ExpVar() expvar.Var {
 	m.Set("home_moves_out", &s.homeMovesOut)
 	m.Set("got_ping", &s.gotPing)
 	m.Set("sent_pong", &s.sentPong)
-	m.Set("peer_gone_frames", &s.peerGoneFrames)
+	m.Set("peer_gone_disconnected_frames", &s.peerGoneDisconnectedFrames)
+	m.Set("peer_gone_not_here_frames", &s.peerGoneNotHereFrames)
 	m.Set("packets_forwarded_out", &s.packetsForwardedOut)
 	m.Set("packets_forwarded_in", &s.packetsForwardedIn)
 	m.Set("multiforwarder_created", &s.multiForwarderCreated)
@@ -1705,7 +1900,7 @@ func (s *Server) ExpVar() expvar.Var {
 	}))
 	m.Set("counter_tcp_rtt", &s.tcpRtt)
 	var expvarVersion expvar.String
-	expvarVersion.Set(version.Long)
+	expvarVersion.Set(version.Long())
 	m.Set("version", &expvarVersion)
 	return m
 }

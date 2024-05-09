@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package disco
 
@@ -35,6 +34,23 @@ func TestMarshalAndParse(t *testing.T) {
 				NodeKey: key.NodePublicFromRaw32(mem.B([]byte{1: 1, 2: 2, 30: 30, 31: 31})),
 			},
 			want: "01 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 00 01 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 1f",
+		},
+		{
+			name: "ping_with_padding",
+			m: &Ping{
+				TxID:    [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+				Padding: 3,
+			},
+			want: "01 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 00 00 00",
+		},
+		{
+			name: "ping_with_padding_and_nodekey_src",
+			m: &Ping{
+				TxID:    [12]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+				NodeKey: key.NodePublicFromRaw32(mem.B([]byte{1: 1, 2: 2, 30: 30, 31: 31})),
+				Padding: 3,
+			},
+			want: "01 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 00 01 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 1e 1f 00 00 00",
 		},
 		{
 			name: "pong",
@@ -72,10 +88,10 @@ func TestMarshalAndParse(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			foo := []byte("foo")
 			got := string(tt.m.AppendMarshal(foo))
-			if !strings.HasPrefix(got, "foo") {
+			got, ok := strings.CutPrefix(got, "foo")
+			if !ok {
 				t.Fatalf("didn't start with foo: got %q", got)
 			}
-			got = strings.TrimPrefix(got, "foo")
 
 			gotHex := fmt.Sprintf("% x", got)
 			if gotHex != tt.want {

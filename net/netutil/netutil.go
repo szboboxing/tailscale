@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package netutil contains misc shared networking code & types.
 package netutil
@@ -53,12 +52,6 @@ func (ln *oneConnListener) Close() error {
 	ln.Accept() // guarantee future call returns io.EOF
 	return nil
 }
-
-type dummyListener struct{}
-
-func (dummyListener) Close() error                    { return nil }
-func (dummyListener) Addr() net.Addr                  { return dummyAddr("unused-address") }
-func (dummyListener) Accept() (c net.Conn, err error) { return nil, io.EOF }
 
 type dummyAddr string
 

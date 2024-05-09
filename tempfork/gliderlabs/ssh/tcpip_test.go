@@ -1,10 +1,10 @@
 //go:build glidertests
-// +build glidertests
 
 package ssh
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"strconv"
 	"strings"

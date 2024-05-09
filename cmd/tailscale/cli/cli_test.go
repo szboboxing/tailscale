@@ -1,11 +1,11 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
 import (
 	"bytes"
+	stdcmp "cmp"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,13 +16,122 @@ import (
 
 	qt "github.com/frankban/quicktest"
 	"github.com/google/go-cmp/cmp"
+	"tailscale.com/envknob"
+	"tailscale.com/health/healthmsg"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
+	"tailscale.com/tka"
 	"tailscale.com/tstest"
+	"tailscale.com/types/logger"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
 	"tailscale.com/version/distro"
 )
+
+func TestPanicIfAnyEnvCheckedInInit(t *testing.T) {
+	envknob.PanicIfAnyEnvCheckedInInit()
+}
+
+func TestShortUsage(t *testing.T) {
+	t.Setenv("TAILSCALE_USE_WIP_CODE", "1")
+	if !envknob.UseWIPCode() {
+		t.Fatal("expected envknob.UseWIPCode() to be true")
+	}
+
+	walkCommands(newRootCmd(), func(w cmdWalk) bool {
+		c, parents := w.Command, w.parents
+
+		// Words that we expect to be in the usage.
+		words := make([]string, len(parents)+1)
+		for i, parent := range parents {
+			words[i] = parent.Name
+		}
+		words[len(parents)] = c.Name
+
+		// Check the ShortHelp starts with a capital letter.
+		if prefix, help := trimPrefixes(c.ShortHelp, "HIDDEN: ", "[ALPHA] ", "[BETA] "); help != "" {
+			if 'a' <= help[0] && help[0] <= 'z' {
+				if len(help) > 20 {
+					help = help[:20] + "…"
+				}
+				caphelp := string(help[0]-'a'+'A') + help[1:]
+				t.Errorf("command: %s: ShortHelp %q should start with a capital letter %q", strings.Join(words, " "), prefix+help, prefix+caphelp)
+			}
+		}
+
+		// Check all words appear in the usage.
+		usage := c.ShortUsage
+		for _, word := range words {
+			var ok bool
+			usage, ok = cutWord(usage, word)
+			if !ok {
+				full := strings.Join(words, " ")
+				t.Errorf("command: %s: usage %q should contain the full path %q", full, c.ShortUsage, full)
+				return true
+			}
+		}
+		return true
+	})
+}
+
+func trimPrefixes(full string, prefixes ...string) (trimmed, remaining string) {
+	s := full
+start:
+	for _, p := range prefixes {
+		var ok bool
+		s, ok = strings.CutPrefix(s, p)
+		if ok {
+			goto start
+		}
+	}
+	return full[:len(full)-len(s)], s
+}
+
+// cutWord("tailscale debug scale 123", "scale") returns (" 123", true).
+func cutWord(s, w string) (after string, ok bool) {
+	var p string
+	for {
+		p, s, ok = strings.Cut(s, w)
+		if !ok {
+			return "", false
+		}
+		if p != "" && isWordChar(p[len(p)-1]) {
+			continue
+		}
+		if s != "" && isWordChar(s[0]) {
+			continue
+		}
+		return s, true
+	}
+}
+
+func isWordChar(r byte) bool {
+	return r == '_' ||
+		('0' <= r && r <= '9') ||
+		('A' <= r && r <= 'Z') ||
+		('a' <= r && r <= 'z')
+}
+
+func TestCutWord(t *testing.T) {
+	tests := []struct {
+		in   string
+		word string
+		out  string
+		ok   bool
+	}{
+		{"tailscale debug", "debug", "", true},
+		{"tailscale debug", "bug", "", false},
+		{"tailscale debug", "tail", "", false},
+		{"tailscale debug scaley scale 123", "scale", " 123", true},
+	}
+	for _, test := range tests {
+		out, ok := cutWord(test.in, test.word)
+		if out != test.out || ok != test.ok {
+			t.Errorf("cutWord(%q, %q) = (%q, %t), wanted (%q, %t)", test.in, test.word, out, ok, test.out, test.ok)
+		}
+	}
+}
 
 // geese is a collection of gooses. It need not be complete.
 // But it should include anything handled specially (e.g. linux, windows)
@@ -36,7 +145,7 @@ var geese = []string{"linux", "darwin", "windows", "freebsd"}
 func TestUpdateMaskedPrefsFromUpFlag(t *testing.T) {
 	for _, goos := range geese {
 		var upArgs upArgsT
-		fs := newUpFlagSet(goos, &upArgs)
+		fs := newUpFlagSet(goos, &upArgs, "up")
 		fs.VisitAll(func(f *flag.Flag) {
 			mp := new(ipn.MaskedPrefs)
 			updateMaskedPrefsFromUpOrSetFlag(mp, f.Name)
@@ -478,6 +587,19 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			distro: "", // not Synology
 			want:   accidentalUpPrefix + " --hostname=foo --accept-routes",
 		},
+		{
+			name:  "profile_name_ignored_in_up",
+			flags: []string{"--hostname=foo"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				CorpDNS:          true,
+				AllowSingleHosts: true,
+				NetfilterMode:    preftype.NetfilterOn,
+				ProfileName:      "foo",
+			},
+			goos: "linux",
+			want: "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -486,7 +608,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 				goos = tt.goos
 			}
 			var upArgs upArgsT
-			flagSet := newUpFlagSet(goos, &upArgs)
+			flagSet := newUpFlagSet(goos, &upArgs, "up")
 			flags := CleanUpArgs(tt.flags)
 			flagSet.Parse(flags)
 			newPrefs, err := prefsFromUpArgs(upArgs, t.Logf, new(ipnstate.Status), goos)
@@ -513,7 +635,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 }
 
 func upArgsFromOSArgs(goos string, flagArgs ...string) (args upArgsT) {
-	fs := newUpFlagSet(goos, &args)
+	fs := newUpFlagSet(goos, &args, "up")
 	fs.Parse(flagArgs) // populates args
 	return
 }
@@ -533,12 +655,16 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			goos: "linux",
 			args: upArgsFromOSArgs("linux"),
 			want: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				WantRunning:      true,
-				NoSNAT:           false,
-				NetfilterMode:    preftype.NetfilterOn,
-				CorpDNS:          true,
-				AllowSingleHosts: true,
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         true,
+				NoSNAT:              false,
+				NoStatefulFiltering: "false",
+				NetfilterMode:       preftype.NetfilterOn,
+				CorpDNS:             true,
+				AllowSingleHosts:    true,
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
 			},
 		},
 		{
@@ -546,12 +672,17 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			goos: "windows",
 			args: upArgsFromOSArgs("windows"),
 			want: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				WantRunning:      true,
-				CorpDNS:          true,
-				AllowSingleHosts: true,
-				RouteAll:         true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         true,
+				CorpDNS:             true,
+				AllowSingleHosts:    true,
+				RouteAll:            true,
+				NoSNAT:              false,
+				NoStatefulFiltering: "false",
+				NetfilterMode:       preftype.NetfilterOn,
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
 			},
 		},
 		{
@@ -566,7 +697,11 @@ func TestPrefsFromUpArgs(t *testing.T) {
 					netip.MustParsePrefix("0.0.0.0/0"),
 					netip.MustParsePrefix("::/0"),
 				},
-				NetfilterMode: preftype.NetfilterOn,
+				NoStatefulFiltering: "false",
+				NetfilterMode:       preftype.NetfilterOn,
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
 			},
 		},
 		{
@@ -607,9 +742,16 @@ func TestPrefsFromUpArgs(t *testing.T) {
 		{
 			name: "error_long_hostname",
 			args: upArgsT{
-				hostname: strings.Repeat("a", 300),
+				hostname: strings.Repeat(strings.Repeat("a", 63)+".", 4),
 			},
-			wantErr: `hostname too long: 300 bytes (max 256)`,
+			wantErr: `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" is too long to be a DNS name`,
+		},
+		{
+			name: "error_long_label",
+			args: upArgsT{
+				hostname: strings.Repeat("a", 64) + ".example.com",
+			},
+			wantErr: `"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" is not a valid DNS label`,
 		},
 		{
 			name: "error_linux_netfilter_empty",
@@ -643,9 +785,13 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			},
 			wantWarn: "netfilter=nodivert; add iptables calls to ts-* chains manually.",
 			want: &ipn.Prefs{
-				WantRunning:   true,
-				NetfilterMode: preftype.NetfilterNoDivert,
-				NoSNAT:        true,
+				WantRunning:         true,
+				NetfilterMode:       preftype.NetfilterNoDivert,
+				NoSNAT:              true,
+				NoStatefulFiltering: "true",
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
 			},
 		},
 		{
@@ -656,9 +802,13 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			},
 			wantWarn: "netfilter=off; configure iptables yourself.",
 			want: &ipn.Prefs{
-				WantRunning:   true,
-				NetfilterMode: preftype.NetfilterOff,
-				NoSNAT:        true,
+				WantRunning:         true,
+				NetfilterMode:       preftype.NetfilterOff,
+				NoSNAT:              true,
+				NoStatefulFiltering: "true",
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
 			},
 		},
 		{
@@ -669,10 +819,33 @@ func TestPrefsFromUpArgs(t *testing.T) {
 				netfilterMode:   "off",
 			},
 			want: &ipn.Prefs{
-				WantRunning: true,
-				NoSNAT:      true,
+				WantRunning:         true,
+				NoSNAT:              true,
+				NoStatefulFiltering: "true",
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("fd7a:115c:a1e0:b1a::bb:10.0.0.0/112"),
+				},
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
+				},
+			},
+		},
+		{
+			name: "via_route_good_16_bit",
+			goos: "linux",
+			args: upArgsT{
+				advertiseRoutes: "fd7a:115c:a1e0:b1a::aabb:10.0.0.0/112",
+				netfilterMode:   "off",
+			},
+			want: &ipn.Prefs{
+				WantRunning:         true,
+				NoSNAT:              true,
+				NoStatefulFiltering: "true",
+				AdvertiseRoutes: []netip.Prefix{
+					netip.MustParsePrefix("fd7a:115c:a1e0:b1a::aabb:10.0.0.0/112"),
+				},
+				AutoUpdate: ipn.AutoUpdatePrefs{
+					Check: true,
 				},
 			},
 		},
@@ -692,16 +865,13 @@ func TestPrefsFromUpArgs(t *testing.T) {
 				advertiseRoutes: "fd7a:115c:a1e0:b1a:1234:5678::/112",
 				netfilterMode:   "off",
 			},
-			wantErr: "route fd7a:115c:a1e0:b1a:1234:5678::/112 contains invalid site ID 12345678; must be 0xff or less",
+			wantErr: "route fd7a:115c:a1e0:b1a:1234:5678::/112 contains invalid site ID 12345678; must be 0xffff or less",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var warnBuf tstest.MemLogger
-			goos := tt.goos
-			if goos == "" {
-				goos = "linux"
-			}
+			goos := stdcmp.Or(tt.goos, "linux")
 			st := tt.st
 			if st == nil {
 				st = new(ipnstate.Status)
@@ -741,12 +911,12 @@ func TestPrefFlagMapping(t *testing.T) {
 	prefHasFlag := map[string]bool{}
 	for _, pv := range prefsOfFlag {
 		for _, pref := range pv {
-			prefHasFlag[pref] = true
+			prefHasFlag[strings.Split(pref, ".")[0]] = true
 		}
 	}
 
-	prefType := reflect.TypeOf(ipn.Prefs{})
-	for i := 0; i < prefType.NumField(); i++ {
+	prefType := reflect.TypeFor[ipn.Prefs]()
+	for i := range prefType.NumField() {
 		prefName := prefType.Field(i).Name
 		if prefHasFlag[prefName] {
 			continue
@@ -765,6 +935,21 @@ func TestPrefFlagMapping(t *testing.T) {
 		case "Egg":
 			// Not applicable.
 			continue
+		case "RunWebClient":
+			// TODO(tailscale/corp#14335): Currently behind a feature flag.
+			continue
+		case "NetfilterKind":
+			// Handled by TS_DEBUG_FIREWALL_MODE env var, we don't want to have
+			// a CLI flag for this. The Pref is used by c2n.
+			continue
+		case "DriveShares":
+			// Handled by the tailscale share subcommand, we don't want a CLI
+			// flag for this.
+			continue
+		case "InternalExitNodePrior":
+			// Used internally by LocalBackend as part of exit node usage toggling.
+			// No CLI flag for this.
+			continue
 		}
 		t.Errorf("unexpected new ipn.Pref field %q is not handled by up.go (see addPrefFlagMapping and checkForAccidentalSettingReverts)", prefName)
 	}
@@ -773,7 +958,7 @@ func TestPrefFlagMapping(t *testing.T) {
 func TestFlagAppliesToOS(t *testing.T) {
 	for _, goos := range geese {
 		var upArgs upArgsT
-		fs := newUpFlagSet(goos, &upArgs)
+		fs := newUpFlagSet(goos, &upArgs, "up")
 		fs.VisitAll(func(f *flag.Flag) {
 			if !flagAppliesToOS(f.Name, goos) {
 				t.Errorf("flagAppliesToOS(%q, %q) = false but found in %s set", f.Name, goos, goos)
@@ -815,7 +1000,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{},
 			curPrefs: &ipn.Prefs{
 				ControlURL: ipn.DefaultControlURL,
-				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:    &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 			},
 			env: upCheckEnv{
 				backendState: "Stopped",
@@ -827,7 +1012,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{},
 			curPrefs: &ipn.Prefs{
 				ControlURL: ipn.DefaultControlURL,
-				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:    &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 			},
 			env:            upCheckEnv{backendState: "Running"},
 			wantSimpleUp:   true,
@@ -838,13 +1023,14 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{"--reset"},
 			curPrefs: &ipn.Prefs{
 				ControlURL: ipn.DefaultControlURL,
-				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:    &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 			},
 			env: upCheckEnv{backendState: "Running"},
 			wantJustEditMP: &ipn.MaskedPrefs{
 				AdvertiseRoutesSet:        true,
 				AdvertiseTagsSet:          true,
 				AllowSingleHostsSet:       true,
+				AppConnectorSet:           true,
 				ControlURLSet:             true,
 				CorpDNSSet:                true,
 				ExitNodeAllowLANAccessSet: true,
@@ -853,6 +1039,7 @@ func TestUpdatePrefs(t *testing.T) {
 				HostnameSet:               true,
 				NetfilterModeSet:          true,
 				NoSNATSet:                 true,
+				NoStatefulFilteringSet:    true,
 				OperatorUserSet:           true,
 				RouteAllSet:               true,
 				RunSSHSet:                 true,
@@ -865,7 +1052,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{},
 			curPrefs: &ipn.Prefs{
 				ControlURL: "https://login.tailscale.com",
-				Persist:    &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:    &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 			},
 			env:            upCheckEnv{backendState: "Running"},
 			wantSimpleUp:   true,
@@ -876,7 +1063,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{"--login-server=https://localhost:1000"},
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -891,7 +1078,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{"--advertise-tags=tag:foo"},
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -925,7 +1112,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{"--ssh"},
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -946,7 +1133,7 @@ func TestUpdatePrefs(t *testing.T) {
 			flags: []string{"--ssh=false"},
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				RunSSH:           true,
@@ -971,7 +1158,7 @@ func TestUpdatePrefs(t *testing.T) {
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -995,7 +1182,7 @@ func TestUpdatePrefs(t *testing.T) {
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -1018,7 +1205,7 @@ func TestUpdatePrefs(t *testing.T) {
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				NetfilterMode:    preftype.NetfilterOn,
@@ -1040,7 +1227,7 @@ func TestUpdatePrefs(t *testing.T) {
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
 				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{LoginName: "crawshaw.github"},
+				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
 				AllowSingleHosts: true,
 				CorpDNS:          true,
 				RunSSH:           true,
@@ -1057,18 +1244,90 @@ func TestUpdatePrefs(t *testing.T) {
 			},
 			env: upCheckEnv{backendState: "Running"},
 		},
+		{
+			name:             "force_reauth_over_ssh_no_risk",
+			flags:            []string{"--force-reauth"},
+			sshOverTailscale: true,
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			env:          upCheckEnv{backendState: "Running"},
+			wantErrSubtr: "aborted, no changes made",
+		},
+		{
+			name:             "force_reauth_over_ssh",
+			flags:            []string{"--force-reauth", "--accept-risk=lose-ssh"},
+			sshOverTailscale: true,
+			curPrefs: &ipn.Prefs{
+				ControlURL:       "https://login.tailscale.com",
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			wantJustEditMP: nil,
+			env:            upCheckEnv{backendState: "Running"},
+		},
+		{
+			name:  "advertise_connector",
+			flags: []string{"--advertise-connector"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:       ipn.DefaultControlURL,
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+			},
+			wantJustEditMP: &ipn.MaskedPrefs{
+				AppConnectorSet: true,
+				WantRunningSet:  true,
+			},
+			env: upCheckEnv{backendState: "Running"},
+			checkUpdatePrefsMutations: func(t *testing.T, newPrefs *ipn.Prefs) {
+				if !newPrefs.AppConnector.Advertise {
+					t.Errorf("prefs.AppConnector.Advertise not set")
+				}
+			},
+		},
+		{
+			name:  "no_advertise_connector",
+			flags: []string{"--advertise-connector=false"},
+			curPrefs: &ipn.Prefs{
+				ControlURL:       ipn.DefaultControlURL,
+				AllowSingleHosts: true,
+				CorpDNS:          true,
+				NetfilterMode:    preftype.NetfilterOn,
+				AppConnector: ipn.AppConnectorPrefs{
+					Advertise: true,
+				},
+			},
+			wantJustEditMP: &ipn.MaskedPrefs{
+				AppConnectorSet: true,
+				WantRunningSet:  true,
+			},
+			env: upCheckEnv{backendState: "Running"},
+			checkUpdatePrefsMutations: func(t *testing.T, newPrefs *ipn.Prefs) {
+				if newPrefs.AppConnector.Advertise {
+					t.Errorf("prefs.AppConnector.Advertise not unset")
+				}
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.sshOverTailscale {
-				old := getSSHClientEnvVar
-				getSSHClientEnvVar = func() string { return "100.100.100.100 1 1" }
-				t.Cleanup(func() { getSSHClientEnvVar = old })
+				tstest.Replace(t, &getSSHClientEnvVar, func() string { return "100.100.100.100 1 1" })
+			} else if isSSHOverTailscale() {
+				// The test is being executed over a "real" tailscale SSH
+				// session, but sshOverTailscale is unset. Make the test appear
+				// as if it's not over tailscale SSH.
+				tstest.Replace(t, &getSSHClientEnvVar, func() string { return "" })
 			}
 			if tt.env.goos == "" {
 				tt.env.goos = "linux"
 			}
-			tt.env.flagSet = newUpFlagSet(tt.env.goos, &tt.env.upArgs)
+			tt.env.flagSet = newUpFlagSet(tt.env.goos, &tt.env.upArgs, "up")
 			flags := CleanUpArgs(tt.flags)
 			if err := tt.env.flagSet.Parse(flags); err != nil {
 				t.Fatal(err)
@@ -1102,16 +1361,11 @@ func TestUpdatePrefs(t *testing.T) {
 				justEditMP.Prefs = ipn.Prefs{} // uninteresting
 			}
 			if !reflect.DeepEqual(justEditMP, tt.wantJustEditMP) {
-				t.Logf("justEditMP != wantJustEditMP; following diff omits the Prefs field, which was \n%v", asJSON(oldEditPrefs))
+				t.Logf("justEditMP != wantJustEditMP; following diff omits the Prefs field, which was \n%v", logger.AsJSON(oldEditPrefs))
 				t.Fatalf("justEditMP: %v\n\n: ", cmp.Diff(justEditMP, tt.wantJustEditMP, cmpIP))
 			}
 		})
 	}
-}
-
-func asJSON(v any) string {
-	b, _ := json.MarshalIndent(v, "", "\t")
-	return string(b)
 }
 
 var cmpIP = cmp.Comparer(func(a, b netip.Addr) bool {
@@ -1141,5 +1395,85 @@ func TestCleanUpArgs(t *testing.T) {
 	for _, tt := range tests {
 		got := CleanUpArgs(tt.in)
 		c.Assert(got, qt.DeepEquals, tt.want)
+	}
+}
+
+func TestUpWorthWarning(t *testing.T) {
+	if !upWorthyWarning(healthmsg.WarnAcceptRoutesOff) {
+		t.Errorf("WarnAcceptRoutesOff of %q should be worth warning", healthmsg.WarnAcceptRoutesOff)
+	}
+	if !upWorthyWarning(healthmsg.TailscaleSSHOnBut + "some problem") {
+		t.Errorf("want true for SSH problems")
+	}
+	if upWorthyWarning("not in map poll") {
+		t.Errorf("want false for other misc errors")
+	}
+}
+
+func TestParseNLArgs(t *testing.T) {
+	tcs := []struct {
+		name              string
+		input             []string
+		parseKeys         bool
+		parseDisablements bool
+
+		wantErr          error
+		wantKeys         []tka.Key
+		wantDisablements [][]byte
+	}{
+		{
+			name:              "empty",
+			input:             nil,
+			parseKeys:         true,
+			parseDisablements: true,
+		},
+		{
+			name:      "key no votes",
+			input:     []string{"nlpub:" + strings.Repeat("00", 32)},
+			parseKeys: true,
+			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 1, Public: bytes.Repeat([]byte{0}, 32)}},
+		},
+		{
+			name:      "key with votes",
+			input:     []string{"nlpub:" + strings.Repeat("01", 32) + "?5"},
+			parseKeys: true,
+			wantKeys:  []tka.Key{{Kind: tka.Key25519, Votes: 5, Public: bytes.Repeat([]byte{1}, 32)}},
+		},
+		{
+			name:              "disablements",
+			input:             []string{"disablement:" + strings.Repeat("02", 32), "disablement-secret:" + strings.Repeat("03", 32)},
+			parseDisablements: true,
+			wantDisablements:  [][]byte{bytes.Repeat([]byte{2}, 32), bytes.Repeat([]byte{3}, 32)},
+		},
+		{
+			name:      "disablements not allowed",
+			input:     []string{"disablement:" + strings.Repeat("02", 32)},
+			parseKeys: true,
+			wantErr:   fmt.Errorf("parsing key 1: key hex string doesn't have expected type prefix nlpub:"),
+		},
+		{
+			name:              "keys not allowed",
+			input:             []string{"nlpub:" + strings.Repeat("02", 32)},
+			parseDisablements: true,
+			wantErr:           fmt.Errorf("parsing argument 1: expected value with \"disablement:\" or \"disablement-secret:\" prefix, got %q", "nlpub:0202020202020202020202020202020202020202020202020202020202020202"),
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			keys, disablements, err := parseNLArgs(tc.input, tc.parseKeys, tc.parseDisablements)
+			if (tc.wantErr == nil && err != nil) ||
+				(tc.wantErr != nil && err == nil) ||
+				(tc.wantErr != nil && err != nil && tc.wantErr.Error() != err.Error()) {
+				t.Fatalf("parseNLArgs(%v).err = %v, want %v", tc.input, err, tc.wantErr)
+			}
+
+			if !reflect.DeepEqual(keys, tc.wantKeys) {
+				t.Errorf("keys = %v, want %v", keys, tc.wantKeys)
+			}
+			if !reflect.DeepEqual(disablements, tc.wantDisablements) {
+				t.Errorf("disablements = %v, want %v", disablements, tc.wantDisablements)
+			}
+		})
 	}
 }

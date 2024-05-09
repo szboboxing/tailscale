@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // netlogfmt parses a stream of JSON log messages from stdin and
 // formats the network traffic logs produced by "tailscale.com/wgengine/netlog"
@@ -26,6 +25,7 @@
 package main
 
 import (
+	"cmp"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -36,15 +36,15 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/dsnet/try"
 	jsonv2 "github.com/go-json-experiment/json"
-	"golang.org/x/exp/maps"
-	"golang.org/x/exp/slices"
-	"tailscale.com/logtail"
+	"github.com/go-json-experiment/json/jsontext"
+	"tailscale.com/types/logid"
 	"tailscale.com/types/netlogtype"
 	"tailscale.com/util/must"
 )
@@ -76,13 +76,13 @@ func main() {
 
 func processStream(r io.Reader) (err error) {
 	defer try.Handle(&err)
-	dec := jsonv2.NewDecoder(os.Stdin)
+	dec := jsontext.NewDecoder(os.Stdin)
 	for {
 		processValue(dec)
 	}
 }
 
-func processValue(dec *jsonv2.Decoder) {
+func processValue(dec *jsontext.Decoder) {
 	switch dec.PeekKind() {
 	case '[':
 		processArray(dec)
@@ -93,7 +93,7 @@ func processValue(dec *jsonv2.Decoder) {
 	}
 }
 
-func processArray(dec *jsonv2.Decoder) {
+func processArray(dec *jsontext.Decoder) {
 	try.E1(dec.ReadToken()) // parse '['
 	for dec.PeekKind() != ']' {
 		processValue(dec)
@@ -101,7 +101,7 @@ func processArray(dec *jsonv2.Decoder) {
 	try.E1(dec.ReadToken()) // parse ']'
 }
 
-func processObject(dec *jsonv2.Decoder) {
+func processObject(dec *jsontext.Decoder) {
 	var hasTraffic bool
 	var rawMsg []byte
 	try.E1(dec.ReadToken()) // parse '{'
@@ -137,8 +137,8 @@ func processObject(dec *jsonv2.Decoder) {
 
 type message struct {
 	Logtail struct {
-		ID     logtail.PublicID `json:"id"`
-		Logged time.Time        `json:"server_time"`
+		ID     logid.PublicID `json:"id"`
+		Logged time.Time      `json:"server_time"`
 	} `json:"logtail"`
 	Logged time.Time `json:"logged"`
 	netlogtype.Message
@@ -152,10 +152,10 @@ func printMessage(msg message) {
 		if len(traffic) == 0 {
 			return
 		}
-		slices.SortFunc(traffic, func(x, y netlogtype.ConnectionCounts) bool {
+		slices.SortFunc(traffic, func(x, y netlogtype.ConnectionCounts) int {
 			nx := x.TxPackets + x.TxBytes + x.RxPackets + x.RxBytes
 			ny := y.TxPackets + y.TxBytes + y.RxPackets + y.RxBytes
-			return nx > ny
+			return cmp.Compare(ny, nx)
 		})
 		var sum netlogtype.Counts
 		for _, cc := range traffic {
@@ -314,9 +314,9 @@ func mustMakeNamesByAddr() map[netip.Addr]string {
 	seen := make(map[string]bool)
 	namesByAddr := make(map[netip.Addr]string)
 retry:
-	for i := 0; i < 10; i++ {
-		maps.Clear(seen)
-		maps.Clear(namesByAddr)
+	for i := range 10 {
+		clear(seen)
+		clear(namesByAddr)
 		for _, d := range m.Devices {
 			name := fieldPrefix(d.Name, i)
 			if seen[name] {
@@ -354,7 +354,7 @@ func fieldPrefix(s string, n int) string {
 }
 
 func appendRepeatByte(b []byte, c byte, n int) []byte {
-	for i := 0; i < n; i++ {
+	for range n {
 		b = append(b, c)
 	}
 	return b

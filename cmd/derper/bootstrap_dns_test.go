@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package main
 
@@ -12,14 +11,13 @@ import (
 	"net/url"
 	"reflect"
 	"testing"
+
+	"tailscale.com/tstest"
+	"tailscale.com/tstest/nettest"
 )
 
 func BenchmarkHandleBootstrapDNS(b *testing.B) {
-	prev := *bootstrapDNS
-	*bootstrapDNS = "log.tailscale.io,login.tailscale.com,controlplane.tailscale.com,login.us.tailscale.com"
-	defer func() {
-		*bootstrapDNS = prev
-	}()
+	tstest.Replace(b, bootstrapDNS, "log.tailscale.io,login.tailscale.com,controlplane.tailscale.com,login.us.tailscale.com")
 	refreshBootstrapDNS()
 	w := new(bitbucketResponseWriter)
 	req, _ := http.NewRequest("GET", "https://localhost/bootstrap-dns?q="+url.QueryEscape("log.tailscale.io"), nil)
@@ -58,6 +56,8 @@ func getBootstrapDNS(t *testing.T, q string) dnsEntryMap {
 }
 
 func TestUnpublishedDNS(t *testing.T) {
+	nettest.SkipIfNoNetwork(t)
+
 	const published = "login.tailscale.com"
 	const unpublished = "log.tailscale.io"
 
@@ -101,6 +101,7 @@ func resetMetrics() {
 	publishedDNSMisses.Set(0)
 	unpublishedDNSHits.Set(0)
 	unpublishedDNSMisses.Set(0)
+	bootstrapLookupMap.Clear()
 }
 
 // Verify that we don't count an empty list in the unpublishedDNSCache as a
@@ -151,4 +152,17 @@ func TestUnpublishedDNSEmptyList(t *testing.T) {
 			t.Errorf("got misses=%d; want 0", v)
 		}
 	})
+
+}
+
+func TestLookupMetric(t *testing.T) {
+	d := []string{"a.io", "b.io", "c.io", "d.io", "e.io", "e.io", "e.io", "a.io"}
+	resetMetrics()
+	for _, q := range d {
+		_ = getBootstrapDNS(t, q)
+	}
+	// {"a.io": true, "b.io": true, "c.io": true, "d.io": true, "e.io": true}
+	if bootstrapLookupMap.Len() != 5 {
+		t.Errorf("bootstrapLookupMap.Len() want=5, got %v", bootstrapLookupMap.Len())
+	}
 }

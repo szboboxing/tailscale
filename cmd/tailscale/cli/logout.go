@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package cli
 
@@ -14,7 +13,7 @@ import (
 
 var logoutCmd = &ffcli.Command{
 	Name:       "logout",
-	ShortUsage: "logout [flags]",
+	ShortUsage: "tailscale logout",
 	ShortHelp:  "Disconnect from Tailscale and expire current node key",
 
 	LongHelp: strings.TrimSpace(`

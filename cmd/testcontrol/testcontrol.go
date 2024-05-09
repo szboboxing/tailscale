@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Program testcontrol runs a simple test control server.
 package main
@@ -30,7 +29,7 @@ func main() {
 		DERPMap:         derpMap,
 		ExplicitBaseURL: "http://127.0.0.1:9911",
 	}
-	for i := 0; i < *flagNFake; i++ {
+	for range *flagNFake {
 		control.AddFakeNode()
 	}
 	mux := http.NewServeMux()

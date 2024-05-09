@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
@@ -15,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +23,7 @@ import (
 	"golang.zx2c4.com/wireguard/windows/tunnel/winipcfg"
 	"tailscale.com/atomicfile"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/winutil"
@@ -39,36 +40,64 @@ type windowsManager struct {
 	guid       string
 	nrptDB     *nrptRuleDatabase
 	wslManager *wslManager
+
+	mu      sync.Mutex
+	closing bool
 }
 
-func NewOSConfigurator(logf logger.Logf, interfaceName string) (OSConfigurator, error) {
-	ret := windowsManager{
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, interfaceName string) (OSConfigurator, error) {
+	ret := &windowsManager{
 		logf:       logf,
 		guid:       interfaceName,
-		wslManager: newWSLManager(logf),
+		wslManager: newWSLManager(logf, health),
 	}
 
 	if isWindows10OrBetter() {
 		ret.nrptDB = newNRPTRuleDatabase(logf)
 	}
 
-	// Log WSL status once at startup.
-	if distros, err := wslDistros(); err != nil {
-		logf("WSL: could not list distributions: %v", err)
-	} else {
-		logf("WSL: found %d distributions", len(distros))
-	}
+	go func() {
+		// Log WSL status once at startup.
+		if distros, err := wslDistros(); err != nil {
+			logf("WSL: could not list distributions: %v", err)
+		} else {
+			logf("WSL: found %d distributions", len(distros))
+		}
+	}()
 
 	return ret, nil
 }
 
-func (m windowsManager) openInterfaceKey(pfx winutil.RegistryPathPrefix) (registry.Key, error) {
+func (m *windowsManager) openInterfaceKey(pfx winutil.RegistryPathPrefix) (registry.Key, error) {
+	var key registry.Key
+	var err error
 	path := pfx.WithSuffix(m.guid)
-	key, err := winutil.OpenKeyWait(registry.LOCAL_MACHINE, path, registry.SET_VALUE)
+
+	m.mu.Lock()
+	closing := m.closing
+	m.mu.Unlock()
+	if closing {
+		// Do not wait for the interface key to appear if the manager is being closed.
+		// If it's being closed due to the removal of the wintun adapter,
+		// the key would already be gone by now and will not reappear until tailscaled is restarted.
+		key, err = registry.OpenKey(registry.LOCAL_MACHINE, string(path), registry.SET_VALUE)
+	} else {
+		key, err = winutil.OpenKeyWait(registry.LOCAL_MACHINE, path, registry.SET_VALUE)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("opening %s: %w", path, err)
 	}
 	return key, nil
+}
+
+func (m *windowsManager) muteKeyNotFoundIfClosing(err error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.closing || (!errors.Is(err, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(err, windows.ERROR_PATH_NOT_FOUND)) {
+		return err
+	}
+
+	return nil
 }
 
 func delValue(key registry.Key, name string) error {
@@ -83,7 +112,7 @@ func delValue(key registry.Key, name string) error {
 // system's "primary" resolver.
 //
 // If no resolvers are provided, the Tailscale NRPT rules are deleted.
-func (m windowsManager) setSplitDNS(resolvers []netip.Addr, domains []dnsname.FQDN) error {
+func (m *windowsManager) setSplitDNS(resolvers []netip.Addr, domains []dnsname.FQDN) error {
 	if m.nrptDB == nil {
 		if resolvers == nil {
 			// Just a no-op in this case.
@@ -152,7 +181,7 @@ func setTailscaleHosts(prevHostsFile []byte, hosts []*HostEntry) ([]byte, error)
 }
 
 // setHosts sets the hosts file to contain the given host entries.
-func (m windowsManager) setHosts(hosts []*HostEntry) error {
+func (m *windowsManager) setHosts(hosts []*HostEntry) error {
 	systemDir, err := windows.GetSystemDirectory()
 	if err != nil {
 		return err
@@ -167,7 +196,16 @@ func (m windowsManager) setHosts(hosts []*HostEntry) error {
 		return err
 	}
 	const fileMode = 0 // ignored on windows.
-	return atomicfile.WriteFile(hostsFile, outB, fileMode)
+
+	// This can fail spuriously with an access denied error, so retry it a
+	// few times.
+	for range 5 {
+		if err = atomicfile.WriteFile(hostsFile, outB, fileMode); err == nil {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return err
 }
 
 // setPrimaryDNS sets the given resolvers and domains as the Tailscale
@@ -176,7 +214,7 @@ func (m windowsManager) setHosts(hosts []*HostEntry) error {
 // "primary" resolvers.
 // domains can be set without resolvers, which just contributes new
 // paths to the global DNS search list.
-func (m windowsManager) setPrimaryDNS(resolvers []netip.Addr, domains []dnsname.FQDN) error {
+func (m *windowsManager) setPrimaryDNS(resolvers []netip.Addr, domains []dnsname.FQDN) error {
 	var ipsv4 []string
 	var ipsv6 []string
 
@@ -195,7 +233,7 @@ func (m windowsManager) setPrimaryDNS(resolvers []netip.Addr, domains []dnsname.
 
 	key4, err := m.openInterfaceKey(winutil.IPv4TCPIPInterfacePrefix)
 	if err != nil {
-		return err
+		return m.muteKeyNotFoundIfClosing(err)
 	}
 	defer key4.Close()
 
@@ -217,7 +255,7 @@ func (m windowsManager) setPrimaryDNS(resolvers []netip.Addr, domains []dnsname.
 
 	key6, err := m.openInterfaceKey(winutil.IPv6TCPIPInterfacePrefix)
 	if err != nil {
-		return err
+		return m.muteKeyNotFoundIfClosing(err)
 	}
 	defer key6.Close()
 
@@ -250,7 +288,7 @@ func (m windowsManager) setPrimaryDNS(resolvers []netip.Addr, domains []dnsname.
 	return nil
 }
 
-func (m windowsManager) SetDNS(cfg OSConfig) error {
+func (m *windowsManager) SetDNS(cfg OSConfig) error {
 	// We can configure Windows DNS in one of two ways:
 	//
 	//  - In primary DNS mode, we set the NameServer and SearchList
@@ -372,14 +410,23 @@ func (m windowsManager) SetDNS(cfg OSConfig) error {
 	return nil
 }
 
-func (m windowsManager) SupportsSplitDNS() bool {
+func (m *windowsManager) SupportsSplitDNS() bool {
 	return m.nrptDB != nil
 }
 
-func (m windowsManager) Close() error {
+func (m *windowsManager) Close() error {
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return nil
+	}
+	m.closing = true
+	m.mu.Unlock()
+
 	err := m.SetDNS(OSConfig{})
 	if m.nrptDB != nil {
 		m.nrptDB.Close()
+		m.nrptDB = nil
 	}
 	return err
 }
@@ -387,22 +434,35 @@ func (m windowsManager) Close() error {
 // disableDynamicUpdates sets the appropriate registry values to prevent the
 // Windows DHCP client from sending dynamic DNS updates for our interface to
 // AD domain controllers.
-func (m windowsManager) disableDynamicUpdates() error {
-	if err := m.setSingleDWORD(winutil.IPv4TCPIPInterfacePrefix, "DisableDynamicUpdate", 1); err != nil {
-		return err
+func (m *windowsManager) disableDynamicUpdates() error {
+	prefixen := []winutil.RegistryPathPrefix{
+		winutil.IPv4TCPIPInterfacePrefix,
+		winutil.IPv6TCPIPInterfacePrefix,
 	}
-	if err := m.setSingleDWORD(winutil.IPv6TCPIPInterfacePrefix, "DisableDynamicUpdate", 1); err != nil {
-		return err
+
+	for _, prefix := range prefixen {
+		k, err := m.openInterfaceKey(prefix)
+		if err != nil {
+			return m.muteKeyNotFoundIfClosing(err)
+		}
+		defer k.Close()
+
+		if err := k.SetDWordValue("DisableDynamicUpdate", 1); err != nil {
+			return err
+		}
+		if err := k.SetDWordValue("MaxNumberOfAddressesToRegister", 0); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 // setSingleDWORD opens the Registry Key in HKLM for the interface associated
 // with the windowsManager and sets the "keyPrefix\value" to data.
-func (m windowsManager) setSingleDWORD(prefix winutil.RegistryPathPrefix, value string, data uint32) error {
+func (m *windowsManager) setSingleDWORD(prefix winutil.RegistryPathPrefix, value string, data uint32) error {
 	k, err := m.openInterfaceKey(prefix)
 	if err != nil {
-		return err
+		return m.muteKeyNotFoundIfClosing(err)
 	}
 	defer k.Close()
 	return k.SetDWordValue(value, data)
@@ -416,11 +476,11 @@ func (m windowsManager) setSingleDWORD(prefix winutil.RegistryPathPrefix, value 
 //
 // Further, LLMNR and NetBIOS are being deprecated anyway in favor of MDNS.
 // https://techcommunity.microsoft.com/t5/networking-blog/aligning-on-mdns-ramping-down-netbios-name-resolution-and-llmnr/ba-p/3290816
-func (m windowsManager) disableNetBIOS() error {
+func (m *windowsManager) disableNetBIOS() error {
 	return m.setSingleDWORD(winutil.NetBTInterfacePrefix, "NetbiosOptions", 2)
 }
 
-func (m windowsManager) GetBaseConfig() (OSConfig, error) {
+func (m *windowsManager) GetBaseConfig() (OSConfig, error) {
 	resolvers, err := m.getBasePrimaryResolver()
 	if err != nil {
 		return OSConfig{}, err
@@ -439,7 +499,7 @@ func (m windowsManager) GetBaseConfig() (OSConfig, error) {
 // It's used on Windows 7 to emulate split DNS by trying to figure out
 // what the "previous" primary resolver was. It might be wrong, or
 // incomplete.
-func (m windowsManager) getBasePrimaryResolver() (resolvers []netip.Addr, err error) {
+func (m *windowsManager) getBasePrimaryResolver() (resolvers []netip.Addr, err error) {
 	tsGUID, err := windows.GUIDFromString(m.guid)
 	if err != nil {
 		return nil, err

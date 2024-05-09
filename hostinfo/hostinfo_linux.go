@@ -1,9 +1,7 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux && !android
-// +build linux,!android
 
 package hostinfo
 
@@ -13,8 +11,8 @@ import (
 	"strings"
 
 	"golang.org/x/sys/unix"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/lineread"
-	"tailscale.com/util/strs"
 	"tailscale.com/version/distro"
 )
 
@@ -24,14 +22,12 @@ func init() {
 	distroName = distroNameLinux
 	distroVersion = distroVersionLinux
 	distroCodeName = distroCodeNameLinux
-	if v := linuxDeviceModel(); v != "" {
-		SetDeviceModel(v)
-	}
+	deviceModel = deviceModelLinux
 }
 
 var (
-	lazyVersionMeta = &lazyAtomicValue[versionMeta]{f: ptrTo(linuxVersionMeta)}
-	lazyOSVersion   = &lazyAtomicValue[string]{f: ptrTo(osVersionLinux)}
+	lazyVersionMeta = &lazyAtomicValue[versionMeta]{f: ptr.To(linuxVersionMeta)}
+	lazyOSVersion   = &lazyAtomicValue[string]{f: ptr.To(osVersionLinux)}
 )
 
 type versionMeta struct {
@@ -52,7 +48,7 @@ func distroCodeNameLinux() string {
 	return lazyVersionMeta.Get().DistroCodeName
 }
 
-func linuxDeviceModel() string {
+func deviceModelLinux() string {
 	for _, path := range []string{
 		// First try the Synology-specific location.
 		// Example: "DS916+-j"
@@ -74,7 +70,7 @@ func linuxDeviceModel() string {
 
 func getQnapQtsVersion(versionInfo string) string {
 	for _, field := range strings.Fields(versionInfo) {
-		if suffix, ok := strs.CutPrefix(field, "QTSFW_"); ok {
+		if suffix, ok := strings.CutPrefix(field, "QTSFW_"); ok {
 			return suffix
 		}
 	}
@@ -97,6 +93,8 @@ func linuxVersionMeta() (meta versionMeta) {
 		propFile = "/etc.defaults/VERSION"
 	case distro.OpenWrt:
 		propFile = "/etc/openwrt_release"
+	case distro.Unraid:
+		propFile = "/etc/unraid-version"
 	case distro.WDMyCloud:
 		slurp, _ := os.ReadFile("/etc/version")
 		meta.DistroVersion = string(bytes.TrimSpace(slurp))
@@ -155,6 +153,8 @@ func linuxVersionMeta() (meta versionMeta) {
 		meta.DistroVersion = m["productversion"]
 	case distro.OpenWrt:
 		meta.DistroVersion = m["DISTRIB_RELEASE"]
+	case distro.Unraid:
+		meta.DistroVersion = m["version"]
 	}
 	return
 }

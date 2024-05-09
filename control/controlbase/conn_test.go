@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package controlbase
 
@@ -8,7 +7,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -22,7 +20,7 @@ import (
 
 	chp "golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/nettest"
-	tsnettest "tailscale.com/net/nettest"
+	"tailscale.com/net/memnet"
 	"tailscale.com/types/key"
 )
 
@@ -83,7 +81,7 @@ func (c *bufferedWriteConn) Write(bs []byte) (int, error) {
 // Noise frames at once and decode each in turn without making another
 // syscall.
 func TestFastPath(t *testing.T) {
-	s1, s2 := tsnettest.NewConn("noise", 128000)
+	s1, s2 := memnet.NewConn("noise", 128000)
 	b := &bufferedWriteConn{s1, bufio.NewWriterSize(s1, 10000), false}
 	client, server := pairWithConns(t, b, s2)
 
@@ -93,7 +91,7 @@ func TestFastPath(t *testing.T) {
 
 	const packets = 10
 	s := "test"
-	for i := 0; i < packets; i++ {
+	for range packets {
 		// Many separate writes, to force separate Noise frames that
 		// all get buffered up and then all sent as a single slice to
 		// the server.
@@ -176,7 +174,7 @@ func (c readerConn) Read(bs []byte) (int, error) { return c.r.Read(bs) }
 // Check that the receiver can handle not being able to read an entire
 // frame in a single syscall.
 func TestDataTrickle(t *testing.T) {
-	s1, s2 := tsnettest.NewConn("noise", 128000)
+	s1, s2 := memnet.NewConn("noise", 128000)
 	client, server := pairWithConns(t, s1, readerConn{s2, iotest.OneByteReader(s2)})
 	serverReads := sinkReads(server)
 
@@ -200,7 +198,7 @@ func TestConnStd(t *testing.T) {
 	// they're not on our Conn due to cipher security.
 	t.Skip("not all tests can pass on this Conn, see https://github.com/golang/go/issues/46977")
 	nettest.TestConn(t, func() (c1 net.Conn, c2 net.Conn, stop func(), err error) {
-		s1, s2 := tsnettest.NewConn("noise", 4096)
+		s1, s2 := memnet.NewConn("noise", 4096)
 		controlKey := key.NewMachine()
 		machineKey := key.NewMachine()
 		serverErr := make(chan error, 1)
@@ -253,7 +251,7 @@ func TestConnMemoryOverhead(t *testing.T) {
 	}
 	defer closeAll()
 
-	for i := 0; i < num; i++ {
+	for range num {
 		client, server := pair(t)
 		closers = append(closers, client, server)
 		go func() {
@@ -301,32 +299,6 @@ func TestConnMemoryOverhead(t *testing.T) {
 	if ngo >= ng0+num/10 {
 		t.Errorf("goroutines didn't go back down; started at %v, now %v", ng0, ngo)
 	}
-}
-
-// mkConns creates synthetic Noise Conns wrapping the given net.Conns.
-// This function is for testing just the Conn transport logic without
-// having to muck about with Noise handshakes.
-func mkConns(s1, s2 net.Conn) (*Conn, *Conn) {
-	var k1, k2 [chp.KeySize]byte
-	if _, err := rand.Read(k1[:]); err != nil {
-		panic(err)
-	}
-	if _, err := rand.Read(k2[:]); err != nil {
-		panic(err)
-	}
-
-	ret1 := &Conn{
-		conn: s1,
-		tx:   txState{cipher: newCHP(k1)},
-		rx:   rxState{cipher: newCHP(k2)},
-	}
-	ret2 := &Conn{
-		conn: s2,
-		tx:   txState{cipher: newCHP(k2)},
-		rx:   rxState{cipher: newCHP(k1)},
-	}
-
-	return ret1, ret2
 }
 
 type readSink struct {
@@ -413,6 +385,6 @@ func pairWithConns(t *testing.T, clientConn, serverConn net.Conn) (*Conn, *Conn)
 }
 
 func pair(t *testing.T) (*Conn, *Conn) {
-	s1, s2 := tsnettest.NewConn("noise", 128000)
+	s1, s2 := memnet.NewConn("noise", 128000)
 	return pairWithConns(t, s1, s2)
 }

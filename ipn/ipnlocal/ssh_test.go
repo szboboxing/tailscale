@@ -1,9 +1,7 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux || (darwin && !ios)
-// +build linux darwin,!ios
 
 package ipnlocal
 
@@ -12,6 +10,8 @@ import (
 	"reflect"
 	"testing"
 
+	"tailscale.com/health"
+	"tailscale.com/ipn/store/mem"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/must"
 )
@@ -50,7 +50,8 @@ type fakeSSHServer struct {
 }
 
 func TestGetSSHUsernames(t *testing.T) {
-	b := new(LocalBackend)
+	pm := must.Get(newProfileManager(new(mem.Store), t.Logf, new(health.Tracker)))
+	b := &LocalBackend{pm: pm, store: pm.Store()}
 	b.sshServer = fakeSSHServer{}
 	res, err := b.getSSHUsernames(new(tailcfg.C2NSSHUsernamesRequest))
 	if err != nil {

@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // proxy-to-grafana is a reverse proxy which identifies users based on their
 // originating Tailscale identity and maps them to corresponding Grafana
@@ -89,7 +88,7 @@ func main() {
 
 		go func() {
 			// wait for tailscale to start before trying to fetch cert names
-			for i := 0; i < 60; i++ {
+			for range 60 {
 				st, err := localClient.Status(context.Background())
 				if err != nil {
 					log.Printf("error retrieving tailscale status; retrying: %v", err)
@@ -148,7 +147,7 @@ func getTailscaleUser(ctx context.Context, localClient *tailscale.LocalClient, i
 	if err != nil {
 		return nil, fmt.Errorf("failed to identify remote host: %w", err)
 	}
-	if len(whois.Node.Tags) != 0 {
+	if whois.Node.IsTagged() {
 		return nil, fmt.Errorf("tagged nodes are not users")
 	}
 	if whois.UserProfile == nil || whois.UserProfile.LoginName == "" {

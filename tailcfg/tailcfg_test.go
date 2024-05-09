@@ -1,11 +1,9 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-package tailcfg
+package tailcfg_test
 
 import (
-	"encoding"
 	"encoding/json"
 	"net/netip"
 	"os"
@@ -16,14 +14,16 @@ import (
 	"testing"
 	"time"
 
-	"tailscale.com/tstest"
+	. "tailscale.com/tailcfg"
+	"tailscale.com/tstest/deptest"
 	"tailscale.com/types/key"
+	"tailscale.com/types/opt"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/must"
-	"tailscale.com/version"
 )
 
 func fieldsOf(t reflect.Type) (fields []string) {
-	for i := 0; i < t.NumField(); i++ {
+	for i := range t.NumField() {
 		fields = append(fields, t.Field(i).Name)
 	}
 	return
@@ -41,25 +41,34 @@ func TestHostinfoEqual(t *testing.T) {
 		"Distro",
 		"DistroVersion",
 		"DistroCodeName",
+		"App",
 		"Desktop",
 		"Package",
 		"DeviceModel",
+		"PushDeviceToken",
 		"Hostname",
 		"ShieldsUp",
 		"ShareeNode",
 		"NoLogsNoSupport",
+		"WireIngress",
+		"AllowsUpdate",
+		"Machine",
 		"GoArch",
+		"GoArchVar",
 		"GoVersion",
 		"RoutableIPs",
 		"RequestTags",
+		"WoLMACs",
 		"Services",
 		"NetInfo",
 		"SSH_HostKeys",
 		"Cloud",
 		"Userspace",
 		"UserspaceRouter",
+		"AppConnector",
+		"Location",
 	}
-	if have := fieldsOf(reflect.TypeOf(Hostinfo{})); !reflect.DeepEqual(have, hiHandles) {
+	if have := fieldsOf(reflect.TypeFor[Hostinfo]()); !reflect.DeepEqual(have, hiHandles) {
 		t.Errorf("Hostinfo.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, hiHandles)
 	}
@@ -211,6 +220,26 @@ func TestHostinfoEqual(t *testing.T) {
 			&Hostinfo{},
 			false,
 		},
+		{
+			&Hostinfo{App: "golink"},
+			&Hostinfo{App: "abc"},
+			false,
+		},
+		{
+			&Hostinfo{App: "golink"},
+			&Hostinfo{App: "golink"},
+			true,
+		},
+		{
+			&Hostinfo{AppConnector: opt.Bool("true")},
+			&Hostinfo{AppConnector: opt.Bool("true")},
+			true,
+		},
+		{
+			&Hostinfo{AppConnector: opt.Bool("true")},
+			&Hostinfo{AppConnector: opt.Bool("false")},
+			false,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equal(tt.b)
@@ -328,14 +357,15 @@ func TestNodeEqual(t *testing.T) {
 		"ID", "StableID", "Name", "User", "Sharer",
 		"Key", "KeyExpiry", "KeySignature", "Machine", "DiscoKey",
 		"Addresses", "AllowedIPs", "Endpoints", "DERP", "Hostinfo",
-		"Created", "Tags", "PrimaryRoutes",
-		"LastSeen", "Online", "KeepAlive", "MachineAuthorized",
-		"Capabilities",
+		"Created", "Cap", "Tags", "PrimaryRoutes",
+		"LastSeen", "Online", "MachineAuthorized",
+		"Capabilities", "CapMap",
 		"UnsignedPeerAPIOnly",
 		"ComputedName", "computedHostIfDifferent", "ComputedNameWithHost",
-		"DataPlaneAuditLogID",
+		"DataPlaneAuditLogID", "Expired", "SelfNodeV4MasqAddrForThisPeer",
+		"SelfNodeV6MasqAddrForThisPeer", "IsWireGuardOnly", "IsJailed", "ExitNodeDNSResolvers",
 	}
-	if have := fieldsOf(reflect.TypeOf(Node{})); !reflect.DeepEqual(have, nodeHandles) {
+	if have := fieldsOf(reflect.TypeFor[Node]()); !reflect.DeepEqual(have, nodeHandles) {
 		t.Errorf("Node.Equal check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, nodeHandles)
 	}
@@ -449,13 +479,13 @@ func TestNodeEqual(t *testing.T) {
 			true,
 		},
 		{
-			&Node{Endpoints: []string{}},
+			&Node{Endpoints: []netip.AddrPort{}},
 			&Node{Endpoints: nil},
 			false,
 		},
 		{
-			&Node{Endpoints: []string{}},
-			&Node{Endpoints: []string{}},
+			&Node{Endpoints: []netip.AddrPort{}},
+			&Node{Endpoints: []netip.AddrPort{}},
 			true,
 		},
 		{
@@ -513,6 +543,80 @@ func TestNodeEqual(t *testing.T) {
 			&Node{},
 			false,
 		},
+		{
+			&Node{Expired: true},
+			&Node{},
+			false,
+		},
+		{
+			&Node{},
+			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			false,
+		},
+		{
+			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			&Node{SelfNodeV4MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("100.64.0.1"))},
+			true,
+		},
+		{
+			&Node{},
+			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			false,
+		},
+		{
+			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			&Node{SelfNodeV6MasqAddrForThisPeer: ptr.To(netip.MustParseAddr("2001::3456"))},
+			true,
+		},
+		{
+			&Node{
+				CapMap: NodeCapMap{
+					"foo": []RawMessage{`"foo"`},
+				},
+			},
+			&Node{
+				CapMap: NodeCapMap{
+					"foo": []RawMessage{`"foo"`},
+				},
+			},
+			true,
+		},
+		{
+			&Node{
+				CapMap: NodeCapMap{
+					"bar": []RawMessage{`"foo"`},
+				},
+			},
+			&Node{
+				CapMap: NodeCapMap{
+					"foo": []RawMessage{`"bar"`},
+				},
+			},
+			false,
+		},
+		{
+			&Node{
+				CapMap: NodeCapMap{
+					"foo": nil,
+				},
+			},
+			&Node{
+				CapMap: NodeCapMap{
+					"foo": []RawMessage{`"bar"`},
+				},
+			},
+			false,
+		},
+		{
+			&Node{IsJailed: true},
+			&Node{IsJailed: true},
+			true,
+		},
+		{
+			&Node{IsJailed: false},
+			&Node{IsJailed: true},
+			false,
+		},
 	}
 	for i, tt := range tests {
 		got := tt.a.Equal(tt.b)
@@ -537,34 +641,11 @@ func TestNetInfoFields(t *testing.T) {
 		"PreferredDERP",
 		"LinkType",
 		"DERPLatency",
+		"FirewallMode",
 	}
-	if have := fieldsOf(reflect.TypeOf(NetInfo{})); !reflect.DeepEqual(have, handled) {
+	if have := fieldsOf(reflect.TypeFor[NetInfo]()); !reflect.DeepEqual(have, handled) {
 		t.Errorf("NetInfo.Clone/BasicallyEqually check might be out of sync\nfields: %q\nhandled: %q\n",
 			have, handled)
-	}
-}
-
-type keyIn interface {
-	String() string
-	MarshalText() ([]byte, error)
-}
-
-func testKey(t *testing.T, prefix string, in keyIn, out encoding.TextUnmarshaler) {
-	got, err := in.MarshalText()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := out.UnmarshalText(got); err != nil {
-		t.Fatal(err)
-	}
-	if s := in.String(); string(got) != s {
-		t.Errorf("MarshalText = %q != String %q", got, s)
-	}
-	if !strings.HasPrefix(string(got), prefix) {
-		t.Errorf("%q didn't start with prefix %q", got, prefix)
-	}
-	if reflect.ValueOf(out).Elem().Interface() != in {
-		t.Errorf("mismatch after unmarshal")
 	}
 }
 
@@ -595,7 +676,7 @@ func TestCloneNode(t *testing.T) {
 		{"zero_fields", &Node{
 			Addresses:  make([]netip.Prefix, 0),
 			AllowedIPs: make([]netip.Prefix, 0),
-			Endpoints:  make([]string, 0),
+			Endpoints:  make([]netip.AddrPort, 0),
 		}},
 	}
 	for _, tt := range tests {
@@ -648,29 +729,6 @@ func TestEndpointTypeMarshal(t *testing.T) {
 	}
 }
 
-var sinkBytes []byte
-
-func BenchmarkKeyMarshalText(b *testing.B) {
-	b.ReportAllocs()
-	var k [32]byte
-	for i := 0; i < b.N; i++ {
-		sinkBytes = keyMarshalText("prefix", k)
-	}
-}
-
-func TestAppendKeyAllocs(t *testing.T) {
-	if version.IsRace() {
-		t.Skip("skipping in race detector") // append(b, make([]byte, N)...) not optimized in compiler with race
-	}
-	var k [32]byte
-	err := tstest.MinAllocsPerRun(t, 1, func() {
-		sinkBytes = keyMarshalText("prefix", k)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestRegisterRequestNilClone(t *testing.T) {
 	var nilReq *RegisterRequest
 	got := nilReq.Clone()
@@ -694,4 +752,115 @@ func TestCurrentCapabilityVersion(t *testing.T) {
 	if CapabilityVersion(max) != CurrentCapabilityVersion {
 		t.Errorf("CurrentCapabilityVersion = %d; want %d", CurrentCapabilityVersion, max)
 	}
+}
+
+func TestUnmarshalHealth(t *testing.T) {
+	tests := []struct {
+		in   string   // MapResponse JSON
+		want []string // MapResponse.Health wanted value post-unmarshal
+	}{
+		{in: `{}`},
+		{in: `{"Health":null}`},
+		{in: `{"Health":[]}`, want: []string{}},
+		{in: `{"Health":["bad"]}`, want: []string{"bad"}},
+	}
+	for _, tt := range tests {
+		var mr MapResponse
+		if err := json.Unmarshal([]byte(tt.in), &mr); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(mr.Health, tt.want) {
+			t.Errorf("for %#q: got %v; want %v", tt.in, mr.Health, tt.want)
+		}
+	}
+}
+
+func TestRawMessage(t *testing.T) {
+	// Create a few types of json.RawMessages and then marshal them back and
+	// forth to make sure they round-trip.
+
+	type rule struct {
+		Ports []int `json:",omitempty"`
+	}
+	tests := []struct {
+		name string
+		val  map[string][]rule
+		wire map[string][]RawMessage
+	}{
+		{
+			name: "nil",
+			val:  nil,
+			wire: nil,
+		},
+		{
+			name: "empty",
+			val:  map[string][]rule{},
+			wire: map[string][]RawMessage{},
+		},
+		{
+			name: "one",
+			val: map[string][]rule{
+				"foo": {{Ports: []int{1, 2, 3}}},
+			},
+			wire: map[string][]RawMessage{
+				"foo": {
+					`{"Ports":[1,2,3]}`,
+				},
+			},
+		},
+		{
+			name: "many",
+			val: map[string][]rule{
+				"foo": {{Ports: []int{1, 2, 3}}},
+				"bar": {{Ports: []int{4, 5, 6}}, {Ports: []int{7, 8, 9}}},
+				"baz": nil,
+				"abc": {},
+				"def": {{}},
+			},
+			wire: map[string][]RawMessage{
+				"foo": {
+					`{"Ports":[1,2,3]}`,
+				},
+				"bar": {
+					`{"Ports":[4,5,6]}`,
+					`{"Ports":[7,8,9]}`,
+				},
+				"baz": nil,
+				"abc": {},
+				"def": {"{}"},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			j := must.Get(json.Marshal(tc.val))
+			var gotWire map[string][]RawMessage
+			if err := json.Unmarshal(j, &gotWire); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !reflect.DeepEqual(gotWire, tc.wire) {
+				t.Errorf("got %#v; want %#v", gotWire, tc.wire)
+			}
+
+			j = must.Get(json.Marshal(tc.wire))
+			var gotVal map[string][]rule
+			if err := json.Unmarshal(j, &gotVal); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if !reflect.DeepEqual(gotVal, tc.val) {
+				t.Errorf("got %#v; want %#v", gotVal, tc.val)
+			}
+		})
+	}
+}
+
+func TestDeps(t *testing.T) {
+	deptest.DepChecker{
+		BadDeps: map[string]string{
+			// Make sure we don't again accidentally bring in a dependency on
+			// drive or its transitive dependencies
+			"tailscale.com/drive/driveimpl":  "https://github.com/tailscale/tailscale/pull/10631",
+			"github.com/studio-b12/gowebdav": "https://github.com/tailscale/tailscale/pull/10631",
+		},
+	}.Check(t)
 }

@@ -1,15 +1,12 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build linux
-// +build linux
 
 package dns
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -19,31 +16,9 @@ import (
 	"golang.org/x/sys/unix"
 	"tailscale.com/health"
 	"tailscale.com/logtail/backoff"
-	"tailscale.com/net/netaddr"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 )
-
-// resolvedListenAddr is the listen address of the resolved stub resolver.
-//
-// We only consider resolved to be the system resolver if the stub resolver is;
-// that is, if this address is the sole nameserver in /etc/resolved.conf.
-// In other cases, resolved may be managing the system DNS configuration directly.
-// Then the nameserver list will be a concatenation of those for all
-// the interfaces that register their interest in being a default resolver with
-//
-//	SetLinkDomains([]{{"~.", true}, ...})
-//
-// which includes at least the interface with the default route, i.e. not us.
-// This does not work for us: there is a possibility of getting NXDOMAIN
-// from the other nameservers before we are asked or get a chance to respond.
-// We consider this case as lacking resolved support and fall through to dnsDirect.
-//
-// While it may seem that we need to read a config option to get at this,
-// this address is, in fact, hard-coded into resolved.
-var resolvedListenAddr = netaddr.IPv4(127, 0, 0, 53)
-
-var errNotReady = errors.New("interface not ready")
 
 // DBus entities we talk to.
 //
@@ -88,13 +63,14 @@ type resolvedManager struct {
 	ctx    context.Context
 	cancel func() // terminate the context, for close
 
-	logf  logger.Logf
-	ifidx int
+	logf   logger.Logf
+	health *health.Tracker
+	ifidx  int
 
 	configCR chan changeRequest // tracks OSConfigs changes and error responses
 }
 
-func newResolvedManager(logf logger.Logf, interfaceName string) (*resolvedManager, error) {
+func newResolvedManager(logf logger.Logf, health *health.Tracker, interfaceName string) (*resolvedManager, error) {
 	iface, err := net.InterfaceByName(interfaceName)
 	if err != nil {
 		return nil, err
@@ -107,8 +83,9 @@ func newResolvedManager(logf logger.Logf, interfaceName string) (*resolvedManage
 		ctx:    ctx,
 		cancel: cancel,
 
-		logf:  logf,
-		ifidx: iface.Index,
+		logf:   logf,
+		health: health,
+		ifidx:  iface.Index,
 
 		configCR: make(chan changeRequest),
 	}
@@ -119,8 +96,10 @@ func newResolvedManager(logf logger.Logf, interfaceName string) (*resolvedManage
 }
 
 func (m *resolvedManager) SetDNS(config OSConfig) error {
+	// NOTE: don't close this channel, since it's possible that the SetDNS
+	// call will time out and return before the run loop answers, at which
+	// point it will send on the now-closed channel.
 	errc := make(chan error, 1)
-	defer close(errc)
 
 	select {
 	case <-m.ctx.Done():
@@ -186,7 +165,7 @@ func (m *resolvedManager) run(ctx context.Context) {
 
 		// Reset backoff and SetNSOSHealth after successful on reconnect.
 		bo.BackOff(ctx, nil)
-		health.SetDNSOSHealth(nil)
+		m.health.SetDNSOSHealth(nil)
 		return nil
 	}
 
@@ -264,7 +243,7 @@ func (m *resolvedManager) run(ctx context.Context) {
 			// Set health while holding the lock, because this will
 			// graciously serialize the resync's health outcome with a
 			// concurrent SetDNS call.
-			health.SetDNSOSHealth(err)
+			m.health.SetDNSOSHealth(err)
 			if err != nil {
 				m.logf("failed to configure systemd-resolved: %v", err)
 			}

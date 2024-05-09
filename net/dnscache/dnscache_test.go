@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dnscache
 
@@ -14,6 +13,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"tailscale.com/tstest"
 )
 
 var dialTest = flag.String("dial-test", "", "if non-empty, addr:port to test dial")
@@ -22,7 +23,7 @@ func TestDialer(t *testing.T) {
 	if *dialTest == "" {
 		t.Skip("skipping; --dial-test is blank")
 	}
-	r := new(Resolver)
+	r := &Resolver{Logf: t.Logf}
 	var std net.Dialer
 	dialer := Dialer(std.DialContext, r)
 	t0 := time.Now()
@@ -113,6 +114,7 @@ func TestDialCall_uniqueIPs(t *testing.T) {
 
 func TestResolverAllHostStaticResult(t *testing.T) {
 	r := &Resolver{
+		Logf:       t.Logf,
 		SingleHost: "foo.bar",
 		SingleHostStaticResult: []netip.Addr{
 			netip.MustParseAddr("2001:4860:4860::8888"),
@@ -141,34 +143,8 @@ func TestResolverAllHostStaticResult(t *testing.T) {
 	}
 }
 
-func TestInterleaveSlices(t *testing.T) {
-	testCases := []struct {
-		name string
-		a, b []int
-		want []int
-	}{
-		{name: "equal", a: []int{1, 3, 5}, b: []int{2, 4, 6}, want: []int{1, 2, 3, 4, 5, 6}},
-		{name: "short_b", a: []int{1, 3, 5}, b: []int{2, 4}, want: []int{1, 2, 3, 4, 5}},
-		{name: "short_a", a: []int{1, 3}, b: []int{2, 4, 6}, want: []int{1, 2, 3, 4, 6}},
-		{name: "len_1", a: []int{1}, b: []int{2, 4, 6}, want: []int{1, 2, 4, 6}},
-		{name: "nil_a", a: nil, b: []int{2, 4, 6}, want: []int{2, 4, 6}},
-		{name: "nil_all", a: nil, b: nil, want: []int{}},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			merged := interleaveSlices(tc.a, tc.b)
-			if !reflect.DeepEqual(merged, tc.want) {
-				t.Errorf("got %v; want %v", merged, tc.want)
-			}
-		})
-	}
-}
-
 func TestShouldTryBootstrap(t *testing.T) {
-	oldDebug := debug
-	t.Cleanup(func() { debug = oldDebug })
-	debug = func() bool { return true }
+	tstest.Replace(t, &debug, func() bool { return true })
 
 	type step struct {
 		ip  netip.Addr // IP we pretended to dial
@@ -185,11 +161,12 @@ func TestShouldTryBootstrap(t *testing.T) {
 	errFailed := errors.New("some failure")
 
 	cacheWithFallback := &Resolver{
+		Logf: t.Logf,
 		LookupIPFallback: func(_ context.Context, _ string) ([]netip.Addr, error) {
 			panic("unimplemented")
 		},
 	}
-	cacheNoFallback := &Resolver{}
+	cacheNoFallback := &Resolver{Logf: t.Logf}
 
 	testCases := []struct {
 		name       string

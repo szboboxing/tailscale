@@ -1,17 +1,20 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dnsfallback
 
 import (
+	"context"
 	"encoding/json"
+	"flag"
 	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
 
+	"tailscale.com/net/netmon"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/logger"
 )
 
 func TestGetDERPMap(t *testing.T) {
@@ -25,11 +28,6 @@ func TestGetDERPMap(t *testing.T) {
 }
 
 func TestCache(t *testing.T) {
-	oldlog := logfunc.Load()
-	SetLogger(t.Logf)
-	t.Cleanup(func() {
-		SetLogger(oldlog)
-	})
 	cacheFile := filepath.Join(t.TempDir(), "cache.json")
 
 	// Write initial cache value
@@ -74,7 +72,7 @@ func TestCache(t *testing.T) {
 	cachedDERPMap.Store(nil)
 
 	// Load the cache
-	SetCachePath(cacheFile)
+	SetCachePath(cacheFile, t.Logf)
 	if cm := cachedDERPMap.Load(); !reflect.DeepEqual(initialCache, cm) {
 		t.Fatalf("cached map was %+v; want %+v", cm, initialCache)
 	}
@@ -106,11 +104,6 @@ func TestCache(t *testing.T) {
 }
 
 func TestCacheUnchanged(t *testing.T) {
-	oldlog := logfunc.Load()
-	SetLogger(t.Logf)
-	t.Cleanup(func() {
-		SetLogger(oldlog)
-	})
 	cacheFile := filepath.Join(t.TempDir(), "cache.json")
 
 	// Write initial cache value
@@ -141,7 +134,7 @@ func TestCacheUnchanged(t *testing.T) {
 	cachedDERPMap.Store(nil)
 
 	// Load the cache
-	SetCachePath(cacheFile)
+	SetCachePath(cacheFile, t.Logf)
 	if cm := cachedDERPMap.Load(); !reflect.DeepEqual(initialCache, cm) {
 		t.Fatalf("cached map was %+v; want %+v", cm, initialCache)
 	}
@@ -153,7 +146,7 @@ func TestCacheUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	UpdateCache(initialCache)
+	UpdateCache(initialCache, t.Logf)
 	if _, err := os.Stat(cacheFile); !os.IsNotExist(err) {
 		t.Fatalf("got err=%v; expected to not find cache file", err)
 	}
@@ -174,10 +167,37 @@ func TestCacheUnchanged(t *testing.T) {
 	clonedNode.IPv4 = "1.2.3.5"
 	updatedCache.Regions[99].Nodes = append(updatedCache.Regions[99].Nodes, &clonedNode)
 
-	UpdateCache(updatedCache)
+	UpdateCache(updatedCache, t.Logf)
 	if st, err := os.Stat(cacheFile); err != nil {
 		t.Fatalf("could not stat cache file; err=%v", err)
 	} else if !st.Mode().IsRegular() || st.Size() == 0 {
 		t.Fatalf("didn't find non-empty regular file; mode=%v size=%d", st.Mode(), st.Size())
 	}
+}
+
+var extNetwork = flag.Bool("use-external-network", false, "use the external network in tests")
+
+func TestLookup(t *testing.T) {
+	if !*extNetwork {
+		t.Skip("skipping test without --use-external-network")
+	}
+
+	logf, closeLogf := logger.LogfCloser(t.Logf)
+	defer closeLogf()
+
+	netMon, err := netmon.New(logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := &fallbackResolver{
+		logf:           logf,
+		netMon:         netMon,
+		waitForCompare: true,
+	}
+	addrs, err := resolver.Lookup(context.Background(), "controlplane.tailscale.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("addrs: %+v", addrs)
 }

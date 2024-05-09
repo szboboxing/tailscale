@@ -1,9 +1,7 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
-//go:build linux || (darwin && !ios)
-// +build linux darwin,!ios
+//go:build linux || (darwin && !ios) || freebsd || openbsd
 
 package ipnlocal
 
@@ -22,12 +20,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/tailscale/golang-x-crypto/ssh"
 	"go4.org/mem"
-	"golang.org/x/exp/slices"
 	"tailscale.com/tailcfg"
 	"tailscale.com/util/lineread"
 	"tailscale.com/util/mak"
@@ -212,10 +210,23 @@ func (b *LocalBackend) getSystemSSH_HostKeys() (ret map[string]ssh.Signer) {
 	return ret
 }
 
-func (b *LocalBackend) getSSHHostKeyPublicStrings() (ret []string) {
-	signers, _ := b.GetSSH_HostKeys()
-	for _, signer := range signers {
-		ret = append(ret, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))))
+func (b *LocalBackend) getSSHHostKeyPublicStrings() ([]string, error) {
+	signers, err := b.GetSSH_HostKeys()
+	if err != nil {
+		return nil, err
 	}
-	return ret
+	var keyStrings []string
+	for _, signer := range signers {
+		keyStrings = append(keyStrings, strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signer.PublicKey()))))
+	}
+	return keyStrings, nil
+}
+
+// tailscaleSSHEnabled reports whether Tailscale SSH is currently enabled based
+// on prefs. It returns false if there are no prefs set.
+func (b *LocalBackend) tailscaleSSHEnabled() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	p := b.pm.CurrentPrefs()
+	return p.Valid() && p.RunSSH()
 }

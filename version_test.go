@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tailscaleroot
 
@@ -17,7 +16,7 @@ func TestDockerfileVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`(?m)^go (\d\.\d+)\r?$`).FindStringSubmatch(string(goMod))
+	m := regexp.MustCompile(`(?m)^go (\d\.\d+)\r?($|\.)`).FindStringSubmatch(string(goMod))
 	if m == nil {
 		t.Fatalf("didn't find go version in go.mod")
 	}

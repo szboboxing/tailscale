@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package hostinfo
 
@@ -8,21 +7,33 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/winutil"
+	"tailscale.com/util/winutil/winenv"
 )
 
 func init() {
+	distroName = lazyDistroName.Get
 	osVersion = lazyOSVersion.Get
 	packageType = lazyPackageType.Get
 }
 
 var (
-	lazyOSVersion   = &lazyAtomicValue[string]{f: ptrTo(osVersionWindows)}
-	lazyPackageType = &lazyAtomicValue[string]{f: ptrTo(packageTypeWindows)}
+	lazyDistroName  = &lazyAtomicValue[string]{f: ptr.To(distroNameWindows)}
+	lazyOSVersion   = &lazyAtomicValue[string]{f: ptr.To(osVersionWindows)}
+	lazyPackageType = &lazyAtomicValue[string]{f: ptr.To(packageTypeWindows)}
 )
+
+func distroNameWindows() string {
+	if winenv.IsWindowsServer() {
+		return "Server"
+	}
+	return ""
+}
 
 func osVersionWindows() string {
 	major, minor, build := windows.RtlGetNtVersionNumbers()
@@ -61,12 +72,17 @@ func packageTypeWindows() string {
 	if _, err := os.Stat(`C:\ProgramData\chocolatey\lib\tailscale`); err == nil {
 		return "choco"
 	}
-	if msiSentinel := winutil.GetRegInteger("MSI", 0); msiSentinel == 1 {
+	msiSentinel, _ := winutil.GetRegInteger("MSI")
+	if msiSentinel == 1 {
 		return "msi"
 	}
 	exe, err := os.Executable()
 	if err != nil {
 		return ""
+	}
+	home, _ := os.UserHomeDir()
+	if strings.HasPrefix(exe, filepath.Join(home, "scoop", "apps", "tailscale")) {
+		return "scoop"
 	}
 	dir := filepath.Dir(exe)
 	nsisUninstaller := filepath.Join(dir, "Uninstall-Tailscale.exe")

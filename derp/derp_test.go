@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package derp
 
@@ -19,13 +18,16 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"go4.org/mem"
 	"golang.org/x/time/rate"
-	"tailscale.com/net/nettest"
+	"tailscale.com/disco"
+	"tailscale.com/net/memnet"
+	"tailscale.com/tstest"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
@@ -54,7 +56,7 @@ func TestSendRecv(t *testing.T) {
 	const numClients = 3
 	var clientPrivateKeys []key.NodePrivate
 	var clientKeys []key.NodePublic
-	for i := 0; i < numClients; i++ {
+	for range numClients {
 		priv := key.NewNode()
 		clientPrivateKeys = append(clientPrivateKeys, priv)
 		clientKeys = append(clientKeys, priv.Public())
@@ -71,7 +73,7 @@ func TestSendRecv(t *testing.T) {
 	var recvChs []chan []byte
 	errCh := make(chan error, 3)
 
-	for i := 0; i < numClients; i++ {
+	for i := range numClients {
 		t.Logf("Connecting client %d ...", i)
 		cout, err := net.Dial("tcp", ln.Addr().String())
 		if err != nil {
@@ -90,7 +92,7 @@ func TestSendRecv(t *testing.T) {
 		defer cancel()
 
 		brwServer := bufio.NewReadWriter(bufio.NewReader(cin), bufio.NewWriter(cin))
-		go s.Accept(ctx, cin, brwServer, fmt.Sprintf("test-client-%d", i))
+		go s.Accept(ctx, cin, brwServer, fmt.Sprintf("[abc::def]:%v", i))
 
 		key := clientPrivateKeys[i]
 		brw := bufio.NewReadWriter(bufio.NewReader(cout), bufio.NewWriter(cout))
@@ -105,10 +107,11 @@ func TestSendRecv(t *testing.T) {
 		t.Logf("Connected client %d.", i)
 	}
 
-	var peerGoneCount expvar.Int
+	var peerGoneCountDisconnected expvar.Int
+	var peerGoneCountNotHere expvar.Int
 
 	t.Logf("Starting read loops")
-	for i := 0; i < numClients; i++ {
+	for i := range numClients {
 		go func(i int) {
 			for {
 				m, err := clients[i].Recv()
@@ -121,12 +124,19 @@ func TestSendRecv(t *testing.T) {
 					t.Errorf("unexpected message type %T", m)
 					continue
 				case PeerGoneMessage:
-					peerGoneCount.Add(1)
+					switch m.Reason {
+					case PeerGoneReasonDisconnected:
+						peerGoneCountDisconnected.Add(1)
+					case PeerGoneReasonNotHere:
+						peerGoneCountNotHere.Add(1)
+					default:
+						t.Errorf("unexpected PeerGone reason %v", m.Reason)
+					}
 				case ReceivedPacket:
 					if m.Source.IsZero() {
 						t.Errorf("zero Source address in ReceivedPacket")
 					}
-					recvChs[i] <- append([]byte(nil), m.Data...)
+					recvChs[i] <- bytes.Clone(m.Data)
 				}
 			}
 		}(i)
@@ -171,7 +181,19 @@ func TestSendRecv(t *testing.T) {
 		var got int64
 		dl := time.Now().Add(5 * time.Second)
 		for time.Now().Before(dl) {
-			if got = peerGoneCount.Value(); got == want {
+			if got = peerGoneCountDisconnected.Value(); got == want {
+				return
+			}
+		}
+		t.Errorf("peer gone count = %v; want %v", got, want)
+	}
+
+	wantUnknownPeers := func(want int64) {
+		t.Helper()
+		var got int64
+		dl := time.Now().Add(5 * time.Second)
+		for time.Now().Before(dl) {
+			if got = peerGoneCountNotHere.Value(); got == want {
 				return
 			}
 		}
@@ -193,6 +215,30 @@ func TestSendRecv(t *testing.T) {
 	recv(2, string(msg2))
 	recvNothing(0)
 	recvNothing(1)
+
+	// Send messages to a non-existent node
+	neKey := key.NewNode().Public()
+	msg4 := []byte("not a CallMeMaybe->unknown destination\n")
+	if err := clients[1].Send(neKey, msg4); err != nil {
+		t.Fatal(err)
+	}
+	wantUnknownPeers(0)
+
+	callMe := neKey.AppendTo([]byte(disco.Magic))
+	callMeHeader := make([]byte, disco.NonceLen)
+	callMe = append(callMe, callMeHeader...)
+	if err := clients[1].Send(neKey, callMe); err != nil {
+		t.Fatal(err)
+	}
+	wantUnknownPeers(1)
+
+	// PeerGoneNotHere is rate-limited to 3 times a second
+	for range 5 {
+		if err := clients[1].Send(neKey, callMe); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantUnknownPeers(3)
 
 	wantActive(3, 0)
 	clients[0].NotePreferred(true)
@@ -235,9 +281,9 @@ func TestSendFreeze(t *testing.T) {
 	// Then cathy stops processing messages.
 	// That should not interfere with alice talking to bob.
 
-	newClient := func(ctx context.Context, name string, k key.NodePrivate) (c *Client, clientConn nettest.Conn) {
+	newClient := func(ctx context.Context, name string, k key.NodePrivate) (c *Client, clientConn memnet.Conn) {
 		t.Helper()
-		c1, c2 := nettest.NewConn(name, 1024)
+		c1, c2 := memnet.NewConn(name, 1024)
 		go s.Accept(ctx, c1, bufio.NewReadWriter(bufio.NewReader(c1), bufio.NewWriter(c1)), name)
 
 		brw := bufio.NewReadWriter(bufio.NewReader(c2), bufio.NewWriter(c2))
@@ -343,7 +389,7 @@ func TestSendFreeze(t *testing.T) {
 		// if any tokens remain in the channel, they
 		// must have been generated after drainAny was
 		// called.
-		for i := 0; i < cap(ch); i++ {
+		for range cap(ch) {
 			select {
 			case <-ch:
 			default:
@@ -410,7 +456,7 @@ func TestSendFreeze(t *testing.T) {
 	aliceConn.Close()
 	cathyConn.Close()
 
-	for i := 0; i < cap(errCh); i++ {
+	for range cap(errCh) {
 		err := <-errCh
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
@@ -482,7 +528,7 @@ func newTestServer(t *testing.T, ctx context.Context) *testServer {
 			// TODO: register c in ts so Close also closes it?
 			go func(i int) {
 				brwServer := bufio.NewReadWriter(bufio.NewReader(c), bufio.NewWriter(c))
-				go s.Accept(ctx, c, brwServer, fmt.Sprintf("test-client-%d", i))
+				go s.Accept(ctx, c, brwServer, c.RemoteAddr().String())
 			}(i)
 		}
 	}()
@@ -569,7 +615,7 @@ func (tc *testClient) wantPresent(t *testing.T, peers ...key.NodePublic) {
 		}
 		switch m := m.(type) {
 		case PeerPresentMessage:
-			got := key.NodePublic(m)
+			got := m.Key
 			if !want[got] {
 				t.Fatalf("got peer present for %v; want present for %v", tc.ts.keyName(got), logger.ArgWriter(func(bw *bufio.Writer) {
 					for _, pub := range peers {
@@ -577,6 +623,7 @@ func (tc *testClient) wantPresent(t *testing.T, peers ...key.NodePublic) {
 					}
 				}))
 			}
+			t.Logf("got present with IP %v", m.IPPort)
 			delete(want, got)
 			if len(want) == 0 {
 				return
@@ -595,9 +642,13 @@ func (tc *testClient) wantGone(t *testing.T, peer key.NodePublic) {
 	}
 	switch m := m.(type) {
 	case PeerGoneMessage:
-		got := key.NodePublic(m)
+		got := key.NodePublic(m.Peer)
 		if peer != got {
 			t.Errorf("got gone message for %v; want gone for %v", tc.ts.keyName(got), tc.ts.keyName(peer))
+		}
+		reason := m.Reason
+		if reason != PeerGoneReasonDisconnected {
+			t.Errorf("got gone message for reason %v; wanted %v", reason, PeerGoneReasonDisconnected)
 		}
 	default:
 		t.Fatalf("unexpected message type %T", m)
@@ -658,6 +709,9 @@ func TestWatch(t *testing.T) {
 type testFwd int
 
 func (testFwd) ForwardPacket(key.NodePublic, key.NodePublic, []byte) error {
+	panic("not called in tests")
+}
+func (testFwd) String() string {
 	panic("not called in tests")
 }
 
@@ -723,20 +777,14 @@ func TestForwarderRegistration(t *testing.T) {
 	s.AddPacketForwarder(u1, testFwd(100))
 	s.AddPacketForwarder(u1, testFwd(100)) // dup to trigger dup path
 	want(map[key.NodePublic]PacketForwarder{
-		u1: multiForwarder{
-			testFwd(1):   1,
-			testFwd(100): 2,
-		},
+		u1: newMultiForwarder(testFwd(1), testFwd(100)),
 	})
 	wantCounter(&s.multiForwarderCreated, 1)
 
 	// Removing a forwarder in a multi set that doesn't exist; does nothing.
 	s.RemovePacketForwarder(u1, testFwd(55))
 	want(map[key.NodePublic]PacketForwarder{
-		u1: multiForwarder{
-			testFwd(1):   1,
-			testFwd(100): 2,
-		},
+		u1: newMultiForwarder(testFwd(1), testFwd(100)),
 	})
 
 	// Removing a forwarder in a multi set that does exist should collapse it away
@@ -785,6 +833,77 @@ func TestForwarderRegistration(t *testing.T) {
 	})
 }
 
+type channelFwd struct {
+	// id is to ensure that different instances that reference the
+	// same channel are not equal, as they are used as keys in the
+	// multiForwarder map.
+	id int
+	c  chan []byte
+}
+
+func (f channelFwd) String() string { return "" }
+func (f channelFwd) ForwardPacket(_ key.NodePublic, _ key.NodePublic, packet []byte) error {
+	f.c <- packet
+	return nil
+}
+
+func TestMultiForwarder(t *testing.T) {
+	received := 0
+	var wg sync.WaitGroup
+	ch := make(chan []byte)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	s := &Server{
+		clients:     make(map[key.NodePublic]clientSet),
+		clientsMesh: map[key.NodePublic]PacketForwarder{},
+	}
+	u := pubAll(1)
+	s.AddPacketForwarder(u, channelFwd{1, ch})
+
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ch:
+				received += 1
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			s.AddPacketForwarder(u, channelFwd{2, ch})
+			s.AddPacketForwarder(u, channelFwd{3, ch})
+			s.RemovePacketForwarder(u, channelFwd{2, ch})
+			s.RemovePacketForwarder(u, channelFwd{1, ch})
+			s.AddPacketForwarder(u, channelFwd{1, ch})
+			s.RemovePacketForwarder(u, channelFwd{3, ch})
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}()
+
+	// Number of messages is chosen arbitrarily, just for this loop to
+	// run long enough concurrently with {Add,Remove}PacketForwarder loop above.
+	numMsgs := 5000
+	var fwd PacketForwarder
+	for i := range numMsgs {
+		s.mu.Lock()
+		fwd = s.clientsMesh[u]
+		s.mu.Unlock()
+		fwd.ForwardPacket(u, u, []byte(strconv.Itoa(i)))
+	}
+
+	cancel()
+	wg.Wait()
+	if received != numMsgs {
+		t.Errorf("expected %d messages to be forwarded; got %d", numMsgs, received)
+	}
+}
 func TestMetaCert(t *testing.T) {
 	priv := key.NewNode()
 	pub := priv.Public()
@@ -873,9 +992,10 @@ func TestClientRecv(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &Client{
-				nc:   dummyNetConn{},
-				br:   bufio.NewReader(bytes.NewReader(tt.input)),
-				logf: t.Logf,
+				nc:    dummyNetConn{},
+				br:    bufio.NewReader(bytes.NewReader(tt.input)),
+				logf:  t.Logf,
+				clock: &tstest.Clock{},
 			}
 			got, err := c.Recv()
 			if err != nil {
@@ -1168,7 +1288,7 @@ func TestServerDupClients(t *testing.T) {
 
 func TestLimiter(t *testing.T) {
 	rl := rate.NewLimiter(rate.Every(time.Minute), 100)
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		r := rl.Reserve()
 		d := r.Delay()
 		t.Logf("i=%d, allow=%v, d=%v", i, r.OK(), d)
@@ -1232,7 +1352,7 @@ func benchmarkSendRecvSize(b *testing.B, packetSize int) {
 	b.SetBytes(int64(len(msg)))
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if err := client.Send(clientKey, msg); err != nil {
 			b.Fatal(err)
 		}
@@ -1243,7 +1363,7 @@ func BenchmarkWriteUint32(b *testing.B) {
 	w := bufio.NewWriter(io.Discard)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		writeUint32(w, 0x0ba3a)
 	}
 }
@@ -1261,7 +1381,7 @@ func BenchmarkReadUint32(b *testing.B) {
 	var err error
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sinkU32, err = readUint32(r)
 		if err != nil {
 			b.Fatal(err)
@@ -1318,7 +1438,8 @@ func (w *countWriter) ResetStats() {
 func TestClientSendRateLimiting(t *testing.T) {
 	cw := new(countWriter)
 	c := &Client{
-		bw: bufio.NewWriter(cw),
+		bw:    bufio.NewWriter(cw),
+		clock: &tstest.Clock{},
 	}
 	c.setSendRateLimiter(ServerInfoMessage{})
 
@@ -1333,7 +1454,7 @@ func TestClientSendRateLimiting(t *testing.T) {
 
 	// Flood should all succeed.
 	cw.ResetStats()
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		if err := c.send(key.NodePublic{}, pkt); err != nil {
 			t.Fatal(err)
 		}
@@ -1352,7 +1473,7 @@ func TestClientSendRateLimiting(t *testing.T) {
 		TokenBucketBytesPerSecond: 1,
 		TokenBucketBytesBurst:     int(bytes1 * 2),
 	})
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		if err := c.send(key.NodePublic{}, pkt); err != nil {
 			t.Fatal(err)
 		}

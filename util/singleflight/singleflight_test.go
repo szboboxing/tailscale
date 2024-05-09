@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Copyright 2013 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -70,7 +69,7 @@ func TestDoDupSuppress(t *testing.T) {
 
 	const n = 10
 	wg1.Add(1)
-	for i := 0; i < n; i++ {
+	for range n {
 		wg1.Add(1)
 		wg2.Add(1)
 		go func() {
@@ -168,7 +167,7 @@ func TestPanicDo(t *testing.T) {
 	waited := int32(n)
 	panicCount := int32(0)
 	done := make(chan struct{})
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer func() {
 				if err := recover(); err != nil {
@@ -205,7 +204,7 @@ func TestGoexitDo(t *testing.T) {
 	const n = 5
 	waited := int32(n)
 	done := make(chan struct{})
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			var err error
 			defer func() {

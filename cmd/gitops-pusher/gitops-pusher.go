@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Command gitops-pusher allows users to use a GitOps flow for managing Tailscale ACLs.
 //
@@ -23,6 +22,9 @@ import (
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"github.com/tailscale/hujson"
+	"golang.org/x/oauth2/clientcredentials"
+	"tailscale.com/client/tailscale"
+	"tailscale.com/util/httpm"
 )
 
 var (
@@ -31,6 +33,7 @@ var (
 	cacheFname   = rootFlagSet.String("cache-file", "./version-cache.json", "filename for the previous known version hash")
 	timeout      = rootFlagSet.Duration("timeout", 5*time.Minute, "timeout for the entire CI run")
 	githubSyntax = rootFlagSet.Bool("github-syntax", true, "use GitHub Action error syntax (https://docs.github.com/en/actions/using-workflows/workflow-commands-for-github-actions#setting-an-error-message)")
+	apiServer    = rootFlagSet.String("api-server", "api.tailscale.com", "API server to contact")
 )
 
 func modifiedExternallyError() {
@@ -41,9 +44,9 @@ func modifiedExternallyError() {
 	}
 }
 
-func apply(cache *Cache, tailnet, apiKey string) func(context.Context, []string) error {
+func apply(cache *Cache, client *http.Client, tailnet, apiKey string) func(context.Context, []string) error {
 	return func(ctx context.Context, args []string) error {
-		controlEtag, err := getACLETag(ctx, tailnet, apiKey)
+		controlEtag, err := getACLETag(ctx, client, tailnet, apiKey)
 		if err != nil {
 			return err
 		}
@@ -72,7 +75,7 @@ func apply(cache *Cache, tailnet, apiKey string) func(context.Context, []string)
 			return nil
 		}
 
-		if err := applyNewACL(ctx, tailnet, apiKey, *policyFname, controlEtag); err != nil {
+		if err := applyNewACL(ctx, client, tailnet, apiKey, *policyFname, controlEtag); err != nil {
 			return err
 		}
 
@@ -82,9 +85,9 @@ func apply(cache *Cache, tailnet, apiKey string) func(context.Context, []string)
 	}
 }
 
-func test(cache *Cache, tailnet, apiKey string) func(context.Context, []string) error {
+func test(cache *Cache, client *http.Client, tailnet, apiKey string) func(context.Context, []string) error {
 	return func(ctx context.Context, args []string) error {
-		controlEtag, err := getACLETag(ctx, tailnet, apiKey)
+		controlEtag, err := getACLETag(ctx, client, tailnet, apiKey)
 		if err != nil {
 			return err
 		}
@@ -112,16 +115,16 @@ func test(cache *Cache, tailnet, apiKey string) func(context.Context, []string) 
 			return nil
 		}
 
-		if err := testNewACLs(ctx, tailnet, apiKey, *policyFname); err != nil {
+		if err := testNewACLs(ctx, client, tailnet, apiKey, *policyFname); err != nil {
 			return err
 		}
 		return nil
 	}
 }
 
-func getChecksums(cache *Cache, tailnet, apiKey string) func(context.Context, []string) error {
+func getChecksums(cache *Cache, client *http.Client, tailnet, apiKey string) func(context.Context, []string) error {
 	return func(ctx context.Context, args []string) error {
-		controlEtag, err := getACLETag(ctx, tailnet, apiKey)
+		controlEtag, err := getACLETag(ctx, client, tailnet, apiKey)
 		if err != nil {
 			return err
 		}
@@ -150,8 +153,26 @@ func main() {
 		log.Fatal("set envvar TS_TAILNET to your tailnet's name")
 	}
 	apiKey, ok := os.LookupEnv("TS_API_KEY")
-	if !ok {
-		log.Fatal("set envvar TS_API_KEY to your Tailscale API key")
+	oauthId, oiok := os.LookupEnv("TS_OAUTH_ID")
+	oauthSecret, osok := os.LookupEnv("TS_OAUTH_SECRET")
+	if !ok && (!oiok || !osok) {
+		log.Fatal("set envvar TS_API_KEY to your Tailscale API key or TS_OAUTH_ID and TS_OAUTH_SECRET to your Tailscale OAuth ID and Secret")
+	}
+	if apiKey != "" && (oauthId != "" || oauthSecret != "") {
+		log.Fatal("set either the envvar TS_API_KEY or TS_OAUTH_ID and TS_OAUTH_SECRET")
+	}
+	var client *http.Client
+	if oiok && (oauthId != "" || oauthSecret != "") {
+		// Both should ideally be set, but if either are non-empty it means the user had an intent
+		// to set _something_, so they should receive the oauth error flow.
+		oauthConfig := &clientcredentials.Config{
+			ClientID:     oauthId,
+			ClientSecret: oauthSecret,
+			TokenURL:     fmt.Sprintf("https://%s/api/v2/oauth/token", *apiServer),
+		}
+		client = oauthConfig.Client(context.Background())
+	} else {
+		client = http.DefaultClient
 	}
 	cache, err := LoadCache(*cacheFname)
 	if err != nil {
@@ -168,7 +189,7 @@ func main() {
 		ShortUsage: "gitops-pusher [options] apply",
 		ShortHelp:  "Pushes changes to CONTROL",
 		LongHelp:   `Pushes changes to CONTROL`,
-		Exec:       apply(cache, tailnet, apiKey),
+		Exec:       apply(cache, client, tailnet, apiKey),
 	}
 
 	testCmd := &ffcli.Command{
@@ -176,7 +197,7 @@ func main() {
 		ShortUsage: "gitops-pusher [options] test",
 		ShortHelp:  "Tests ACL changes",
 		LongHelp:   "Tests ACL changes",
-		Exec:       test(cache, tailnet, apiKey),
+		Exec:       test(cache, client, tailnet, apiKey),
 	}
 
 	cksumCmd := &ffcli.Command{
@@ -184,7 +205,7 @@ func main() {
 		ShortUsage: "Shows checksums of ACL files",
 		ShortHelp:  "Fetch checksum of CONTROL's ACL and the local ACL for comparison",
 		LongHelp:   "Fetch checksum of CONTROL's ACL and the local ACL for comparison",
-		Exec:       getChecksums(cache, tailnet, apiKey),
+		Exec:       getChecksums(cache, client, tailnet, apiKey),
 	}
 
 	root := &ffcli.Command{
@@ -227,14 +248,14 @@ func sumFile(fname string) (string, error) {
 	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
-func applyNewACL(ctx context.Context, tailnet, apiKey, policyFname, oldEtag string) error {
+func applyNewACL(ctx context.Context, client *http.Client, tailnet, apiKey, policyFname, oldEtag string) error {
 	fin, err := os.Open(policyFname)
 	if err != nil {
 		return err
 	}
 	defer fin.Close()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://api.tailscale.com/api/v2/tailnet/%s/acl", tailnet), fin)
+	req, err := http.NewRequestWithContext(ctx, httpm.POST, fmt.Sprintf("https://%s/api/v2/tailnet/%s/acl", *apiServer, tailnet), fin)
 	if err != nil {
 		return err
 	}
@@ -243,7 +264,7 @@ func applyNewACL(ctx context.Context, tailnet, apiKey, policyFname, oldEtag stri
 	req.Header.Set("Content-Type", "application/hujson")
 	req.Header.Set("If-Match", `"`+oldEtag+`"`)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -252,7 +273,7 @@ func applyNewACL(ctx context.Context, tailnet, apiKey, policyFname, oldEtag stri
 	got := resp.StatusCode
 	want := http.StatusOK
 	if got != want {
-		var ate ACLTestError
+		var ate ACLGitopsTestError
 		err := json.NewDecoder(resp.Body).Decode(&ate)
 		if err != nil {
 			return err
@@ -264,7 +285,7 @@ func applyNewACL(ctx context.Context, tailnet, apiKey, policyFname, oldEtag stri
 	return nil
 }
 
-func testNewACLs(ctx context.Context, tailnet, apiKey, policyFname string) error {
+func testNewACLs(ctx context.Context, client *http.Client, tailnet, apiKey, policyFname string) error {
 	data, err := os.ReadFile(policyFname)
 	if err != nil {
 		return err
@@ -274,7 +295,7 @@ func testNewACLs(ctx context.Context, tailnet, apiKey, policyFname string) error
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://api.tailscale.com/api/v2/tailnet/%s/acl/validate", tailnet), bytes.NewBuffer(data))
+	req, err := http.NewRequestWithContext(ctx, httpm.POST, fmt.Sprintf("https://%s/api/v2/tailnet/%s/acl/validate", *apiServer, tailnet), bytes.NewBuffer(data))
 	if err != nil {
 		return err
 	}
@@ -282,13 +303,13 @@ func testNewACLs(ctx context.Context, tailnet, apiKey, policyFname string) error
 	req.SetBasicAuth(apiKey, "")
 	req.Header.Set("Content-Type", "application/hujson")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	var ate ACLTestError
+	var ate ACLGitopsTestError
 	err = json.NewDecoder(resp.Body).Decode(&ate)
 	if err != nil {
 		return err
@@ -309,12 +330,12 @@ func testNewACLs(ctx context.Context, tailnet, apiKey, policyFname string) error
 
 var lineColMessageSplit = regexp.MustCompile(`line ([0-9]+), column ([0-9]+): (.*)$`)
 
-type ACLTestError struct {
-	Message string               `json:"message"`
-	Data    []ACLTestErrorDetail `json:"data"`
+// ACLGitopsTestError is redefined here so we can add a custom .Error() response
+type ACLGitopsTestError struct {
+	tailscale.ACLTestError
 }
 
-func (ate ACLTestError) Error() string {
+func (ate ACLGitopsTestError) Error() string {
 	var sb strings.Builder
 
 	if *githubSyntax && lineColMessageSplit.MatchString(ate.Message) {
@@ -331,22 +352,30 @@ func (ate ACLTestError) Error() string {
 	fmt.Fprintln(&sb)
 
 	for _, data := range ate.Data {
-		fmt.Fprintf(&sb, "For user %s:\n", data.User)
-		for _, err := range data.Errors {
-			fmt.Fprintf(&sb, "- %s\n", err)
+		if data.User != "" {
+			fmt.Fprintf(&sb, "For user %s:\n", data.User)
+		}
+
+		if len(data.Errors) > 0 {
+			fmt.Fprint(&sb, "Errors found:\n")
+			for _, err := range data.Errors {
+				fmt.Fprintf(&sb, "- %s\n", err)
+			}
+		}
+
+		if len(data.Warnings) > 0 {
+			fmt.Fprint(&sb, "Warnings found:\n")
+			for _, err := range data.Warnings {
+				fmt.Fprintf(&sb, "- %s\n", err)
+			}
 		}
 	}
 
 	return sb.String()
 }
 
-type ACLTestErrorDetail struct {
-	User   string   `json:"user"`
-	Errors []string `json:"errors"`
-}
-
-func getACLETag(ctx context.Context, tailnet, apiKey string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("https://api.tailscale.com/api/v2/tailnet/%s/acl", tailnet), nil)
+func getACLETag(ctx context.Context, client *http.Client, tailnet, apiKey string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, httpm.GET, fmt.Sprintf("https://%s/api/v2/tailnet/%s/acl", *apiServer, tailnet), nil)
 	if err != nil {
 		return "", err
 	}
@@ -354,7 +383,7 @@ func getACLETag(ctx context.Context, tailnet, apiKey string) (string, error) {
 	req.SetBasicAuth(apiKey, "")
 	req.Header.Set("Accept", "application/hujson")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}

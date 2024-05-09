@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package tests serves a list of tests for tailscale.com/cmd/viewer.
 package tests
@@ -10,7 +9,7 @@ import (
 	"net/netip"
 )
 
-//go:generate go run tailscale.com/cmd/viewer --type=StructWithPtrs,StructWithoutPtrs,Map,StructWithSlices,OnlyGetClone --clone-only-type=OnlyGetClone
+//go:generate go run tailscale.com/cmd/viewer --type=StructWithPtrs,StructWithoutPtrs,Map,StructWithSlices,OnlyGetClone,StructWithEmbedded --clone-only-type=OnlyGetClone
 
 type StructWithoutPtrs struct {
 	Int int
@@ -61,4 +60,9 @@ type StructWithSlices struct {
 
 type OnlyGetClone struct {
 	SinViewerPorFavor bool
+}
+
+type StructWithEmbedded struct {
+	A *StructWithPtrs
+	StructWithSlices
 }

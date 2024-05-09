@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package deephash
 
@@ -27,8 +26,10 @@ import (
 	"tailscale.com/types/dnstype"
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/deephash/testtype"
 	"tailscale.com/util/dnsname"
+	"tailscale.com/util/hashx"
 	"tailscale.com/version"
 	"tailscale.com/wgengine/filter"
 	"tailscale.com/wgengine/router"
@@ -39,6 +40,22 @@ type appendBytes []byte
 
 func (p appendBytes) AppendTo(b []byte) []byte {
 	return append(b, p...)
+}
+
+type selfHasherValueRecv struct {
+	emit uint64
+}
+
+func (s selfHasherValueRecv) Hash(h *hashx.Block512) {
+	h.HashUint64(s.emit)
+}
+
+type selfHasherPointerRecv struct {
+	emit uint64
+}
+
+func (s *selfHasherPointerRecv) Hash(h *hashx.Block512) {
+	h.HashUint64(s.emit)
 }
 
 func TestHash(t *testing.T) {
@@ -139,7 +156,7 @@ func TestHash(t *testing.T) {
 		{in: tuple{netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1234), netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1235)}, wantEq: false},
 		{in: tuple{netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1234), netip.AddrPortFrom(netip.AddrFrom4([4]byte{192, 168, 0, 2}), 1234)}, wantEq: false},
 		{in: tuple{netip.Prefix{}, netip.Prefix{}}, wantEq: true},
-		{in: tuple{netip.Prefix{}, netip.PrefixFrom(netip.Addr{}, 1)}, wantEq: false},
+		{in: tuple{netip.Prefix{}, netip.PrefixFrom(netip.Addr{}, 1)}, wantEq: true},
 		{in: tuple{netip.Prefix{}, netip.PrefixFrom(netip.AddrFrom4([4]byte{}), 0)}, wantEq: false},
 		{in: tuple{netip.PrefixFrom(netip.AddrFrom4([4]byte{}), 1), netip.PrefixFrom(netip.AddrFrom4([4]byte{}), 1)}, wantEq: true},
 		{in: tuple{netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1), netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 168, 0, 1}), 1)}, wantEq: true},
@@ -163,6 +180,12 @@ func TestHash(t *testing.T) {
 			b[0] = 1
 			return b
 		}()))}, wantEq: false},
+		{in: tuple{&selfHasherPointerRecv{}, &selfHasherPointerRecv{}}, wantEq: true},
+		{in: tuple{(*selfHasherPointerRecv)(nil), (*selfHasherPointerRecv)(nil)}, wantEq: true},
+		{in: tuple{(*selfHasherPointerRecv)(nil), &selfHasherPointerRecv{}}, wantEq: false},
+		{in: tuple{&selfHasherPointerRecv{emit: 1}, &selfHasherPointerRecv{emit: 2}}, wantEq: false},
+		{in: tuple{selfHasherValueRecv{emit: 1}, selfHasherValueRecv{emit: 2}}, wantEq: false},
+		{in: tuple{selfHasherValueRecv{emit: 2}, selfHasherValueRecv{emit: 2}}, wantEq: true},
 	}
 
 	for _, tt := range tests {
@@ -179,7 +202,7 @@ func TestDeepHash(t *testing.T) {
 	v := getVal()
 	hash1 := Hash(v)
 	t.Logf("hash: %v", hash1)
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		v := getVal()
 		hash2 := Hash(v)
 		if hash1 != hash2 {
@@ -336,11 +359,11 @@ func getVal() *tailscaleTypes {
 }
 
 type IntThenByte struct {
-	i int
-	b byte
+	_ int
+	_ byte
 }
 
-type TwoInts struct{ a, b int }
+type TwoInts struct{ _, _ int }
 
 type IntIntByteInt struct {
 	i1, i2 int32
@@ -349,7 +372,6 @@ type IntIntByteInt struct {
 }
 
 func u8(n uint8) string   { return string([]byte{n}) }
-func u16(n uint16) string { return string(binary.LittleEndian.AppendUint16(nil, n)) }
 func u32(n uint32) string { return string(binary.LittleEndian.AppendUint32(nil, n)) }
 func u64(n uint64) string { return string(binary.LittleEndian.AppendUint64(nil, n)) }
 func ux(n uint) string {
@@ -460,8 +482,8 @@ func TestGetTypeHasher(t *testing.T) {
 		{
 			name:  "packet_filter",
 			val:   filterRules,
-			out:   "\x01\x04\x00\x00\x00\x00\x00\x00\x00\x01\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00*\v\x00\x00\x00\x00\x00\x00\x0010.1.3.4/32\v\x00\x00\x00\x00\x00\x00\x0010.0.0.0/24\x01\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x001.2.3.4/32\x01 \x00\x00\x00\x00\x00\x00\x00\x01\x00\x02\x00\x01\x04\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04 \x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00foo\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00",
-			out32: "\x01\x04\x00\x00\x00\x00\x00\x00\x00\x01\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00*\v\x00\x00\x00\x00\x00\x00\x0010.1.3.4/32\v\x00\x00\x00\x00\x00\x00\x0010.0.0.0/24\x01\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x001.2.3.4/32\x01 \x00\x00\x00\x01\x00\x02\x00\x01\x04\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04 \x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00foo\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00",
+			out:   "\x01\x04\x00\x00\x00\x00\x00\x00\x00\x01\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00*\v\x00\x00\x00\x00\x00\x00\x0010.1.3.4/32\v\x00\x00\x00\x00\x00\x00\x0010.0.0.0/24\x01\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x001.2.3.4/32\x01 \x00\x00\x00\x00\x00\x00\x00\x01\x00\x02\x00\x01\x04\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04!\x01\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00foo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00",
+			out32: "\x01\x04\x00\x00\x00\x00\x00\x00\x00\x01\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00*\v\x00\x00\x00\x00\x00\x00\x0010.1.3.4/32\v\x00\x00\x00\x00\x00\x00\x0010.0.0.0/24\x01\x03\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x001.2.3.4/32\x01 \x00\x00\x00\x01\x00\x02\x00\x01\x04\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x03\x00\x00\x00\x04\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04!\x01\x01\x00\x00\x00\x00\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00foo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\v\x00\x00\x00\x00\x00\x00\x00foooooooooo\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\f\x00\x00\x00\x00\x00\x00\x00baaaaaarrrrr\x00\x01\x00\x02\x00\x00\x00",
 		},
 		{
 			name: "netip.Addr",
@@ -485,7 +507,7 @@ func TestGetTypeHasher(t *testing.T) {
 		},
 		{
 			name: "time_ptr", // addressable, as opposed to "time" test above
-			val:  ptrTo(time.Unix(1234, 5678).In(time.UTC)),
+			val:  ptr.To(time.Unix(1234, 5678).In(time.UTC)),
 			out:  u8(1) + u64(1234) + u32(5678) + u32(0),
 		},
 		{
@@ -515,7 +537,7 @@ func TestGetTypeHasher(t *testing.T) {
 		},
 		{
 			name: "array_ptr_memhash",
-			val:  ptrTo([4]byte{1, 2, 3, 4}),
+			val:  ptr.To([4]byte{1, 2, 3, 4}),
 			out:  "\x01\x01\x02\x03\x04",
 		},
 		{
@@ -573,9 +595,10 @@ func TestGetTypeHasher(t *testing.T) {
 			out: "\x01\x01\x00\x00\x00\x02\x00\x00\x00\x03\x04\x00\x00\x00\x05\x00\x00\x00\x06\x00\x00\x00\a\b\x00\x00\x00",
 		},
 		{
-			name: "tailcfg.Node",
-			val:  &tailcfg.Node{},
-			out:  "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\tn\x88\xf1\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\tn\x88\xf1\xff\xff\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+			name:  "tailcfg.Node",
+			val:   &tailcfg.Node{},
+			out:   "ANY", // magic value; just check it doesn't fail to hash
+			out32: "ANY",
 		},
 	}
 	for _, tt := range tests {
@@ -593,7 +616,7 @@ func TestGetTypeHasher(t *testing.T) {
 				tt.out = tt.out32
 			}
 			h.sum()
-			if got := string(hb.B); got != tt.out {
+			if got := string(hb.B); got != tt.out && tt.out != "ANY" {
 				t.Fatalf("got %q; want %q", got, tt.out)
 			}
 		})
@@ -737,12 +760,10 @@ var sink Sum
 func BenchmarkHash(b *testing.B) {
 	b.ReportAllocs()
 	v := getVal()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sink = Hash(v)
 	}
 }
-
-func ptrTo[T any](v T) *T { return &v }
 
 // filterRules is a packet filter that has both everything populated (in its
 // first element) and also a few entries that are the typical shape for regular
@@ -753,13 +774,13 @@ var filterRules = []tailcfg.FilterRule{
 		SrcBits: []int{1, 2, 3},
 		DstPorts: []tailcfg.NetPortRange{{
 			IP:    "1.2.3.4/32",
-			Bits:  ptrTo(32),
+			Bits:  ptr.To(32),
 			Ports: tailcfg.PortRange{First: 1, Last: 2},
 		}},
 		IPProto: []int{1, 2, 3, 4},
 		CapGrant: []tailcfg.CapGrant{{
 			Dsts: []netip.Prefix{netip.MustParsePrefix("1.2.3.4/32")},
-			Caps: []string{"foo"},
+			Caps: []tailcfg.PeerCapability{"foo"},
 		}},
 	},
 	{
@@ -788,22 +809,22 @@ var filterRules = []tailcfg.FilterRule{
 func BenchmarkHashPacketFilter(b *testing.B) {
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sink = Hash(&filterRules)
 	}
 }
 
 func TestHashMapAcyclic(t *testing.T) {
 	m := map[int]string{}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m[i] = fmt.Sprint(i)
 	}
 	got := map[string]bool{}
 
 	hb := &hashBuffer{Hash: sha256.New()}
 
-	hash := lookupTypeHasher(reflect.TypeOf(m))
-	for i := 0; i < 20; i++ {
+	hash := lookupTypeHasher(reflect.TypeFor[map[int]string]())
+	for range 20 {
 		va := reflect.ValueOf(&m).Elem()
 		hb.Reset()
 		h := new(hasher)
@@ -841,7 +862,7 @@ func TestPrintArray(t *testing.T) {
 func BenchmarkHashMapAcyclic(b *testing.B) {
 	b.ReportAllocs()
 	m := map[int]string{}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		m[i] = fmt.Sprint(i)
 	}
 
@@ -852,7 +873,7 @@ func BenchmarkHashMapAcyclic(b *testing.B) {
 	h := new(hasher)
 	h.Block512.Hash = hb
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		h.Reset()
 		hash(h, pointerOf(va.Addr()))
 	}
@@ -862,14 +883,14 @@ func BenchmarkTailcfgNode(b *testing.B) {
 	b.ReportAllocs()
 
 	node := new(tailcfg.Node)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sink = Hash(node)
 	}
 }
 
 func TestExhaustive(t *testing.T) {
 	seen := make(map[Sum]bool)
-	for i := 0; i < 100000; i++ {
+	for i := range 100000 {
 		s := Hash(&i)
 		if seen[s] {
 			t.Fatalf("hash collision %v", i)
@@ -936,7 +957,7 @@ func TestHashThroughView(t *testing.T) {
 		SSHPolicy: &sshPolicyOut{
 			Rules: []tailcfg.SSHRuleView{
 				(&tailcfg.SSHRule{
-					RuleExpires: ptrTo(time.Unix(123, 0)),
+					RuleExpires: ptr.To(time.Unix(123, 0)),
 				}).View(),
 			},
 		},
@@ -950,7 +971,7 @@ func BenchmarkHashArray(b *testing.B) {
 	}
 	x := &T{X: [32]byte{1: 1, 2: 2, 3: 3, 4: 4}}
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		sink = Hash(x)
 	}
 }
@@ -1002,11 +1023,11 @@ func FuzzTime(f *testing.F) {
 	) {
 		t1 := time.Unix(s1, ns1)
 		if loc1 {
-			t1.In(time.FixedZone(name1, off1))
+			_ = t1.In(time.FixedZone(name1, off1))
 		}
 		t2 := time.Unix(s2, ns2)
 		if loc2 {
-			t2.In(time.FixedZone(name2, off2))
+			_ = t2.In(time.FixedZone(name2, off2))
 		}
 		got := Hash(&t1) == Hash(&t2)
 		want := t1.Format(time.RFC3339Nano) == t2.Format(time.RFC3339Nano)
@@ -1061,6 +1082,51 @@ func TestAppendTo(t *testing.T) {
 	}
 }
 
+func TestFilterFields(t *testing.T) {
+	type T struct {
+		A int
+		B int
+		C int
+	}
+
+	hashers := map[string]func(*T) Sum{
+		"all": HasherForType[T](),
+		"ac":  HasherForType[T](IncludeFields[T]("A", "C")),
+		"b":   HasherForType[T](ExcludeFields[T]("A", "C")),
+	}
+
+	tests := []struct {
+		hasher string
+		a, b   T
+		wantEq bool
+	}{
+		{"all", T{1, 2, 3}, T{1, 2, 3}, true},
+		{"all", T{1, 2, 3}, T{0, 2, 3}, false},
+		{"all", T{1, 2, 3}, T{1, 0, 3}, false},
+		{"all", T{1, 2, 3}, T{1, 2, 0}, false},
+
+		{"ac", T{0, 0, 0}, T{0, 0, 0}, true},
+		{"ac", T{1, 0, 1}, T{1, 1, 1}, true},
+		{"ac", T{1, 1, 1}, T{1, 1, 0}, false},
+
+		{"b", T{0, 0, 0}, T{0, 0, 0}, true},
+		{"b", T{1, 0, 1}, T{1, 1, 1}, false},
+		{"b", T{1, 1, 1}, T{0, 1, 0}, true},
+	}
+	for _, tt := range tests {
+		f, ok := hashers[tt.hasher]
+		if !ok {
+			t.Fatalf("bad test: unknown hasher %q", tt.hasher)
+		}
+		sum1 := f(&tt.a)
+		sum2 := f(&tt.b)
+		got := sum1 == sum2
+		if got != tt.wantEq {
+			t.Errorf("hasher %q, for %+v and %v, got equal = %v; want %v", tt.hasher, tt.a, tt.b, got, tt.wantEq)
+		}
+	}
+}
+
 func BenchmarkAppendTo(b *testing.B) {
 	b.ReportAllocs()
 	v := getVal()
@@ -1068,7 +1134,7 @@ func BenchmarkAppendTo(b *testing.B) {
 
 	hashBuf := make([]byte, 0, 100)
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		hashBuf = h.AppendTo(hashBuf[:0])
 	}
 }

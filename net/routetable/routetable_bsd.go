@@ -1,9 +1,7 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 //go:build darwin || freebsd
-// +build darwin freebsd
 
 package routetable
 
@@ -19,7 +17,7 @@ import (
 
 	"golang.org/x/net/route"
 	"golang.org/x/sys/unix"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
 )
 
@@ -66,13 +64,23 @@ func (r RouteEntryBSD) Format(f fmt.State, verb rune) {
 		}
 		pr("Flags: %v", r.Flags)
 
+		unknownFlags := r.RawFlags
+		for fv := range flags {
+			if r.RawFlags&fv == fv {
+				unknownFlags &= ^fv
+			}
+		}
+		if unknownFlags != 0 {
+			pr("UnknownFlags: %x ", unknownFlags)
+		}
+
 		w.WriteString("}")
 	}).Format(f, verb)
 }
 
 // ipFromRMAddr returns a netip.Addr converted from one of the
 // route.Inet{4,6}Addr types.
-func ipFromRMAddr(ifs map[int]interfaces.Interface, addr any) netip.Addr {
+func ipFromRMAddr(ifs map[int]netmon.Interface, addr any) netip.Addr {
 	switch v := addr.(type) {
 	case *route.Inet4Addr:
 		return netip.AddrFrom4(v.IP)
@@ -94,7 +102,7 @@ func ipFromRMAddr(ifs map[int]interfaces.Interface, addr any) netip.Addr {
 }
 
 // populateGateway populates gateway fields on a RouteEntry/RouteEntryBSD.
-func populateGateway(re *RouteEntry, reSys *RouteEntryBSD, ifs map[int]interfaces.Interface, addr any) {
+func populateGateway(re *RouteEntry, reSys *RouteEntryBSD, ifs map[int]netmon.Interface, addr any) {
 	// If the address type has a valid IP, use that.
 	if ip := ipFromRMAddr(ifs, addr); ip.IsValid() {
 		re.Gateway = ip
@@ -120,7 +128,7 @@ func populateGateway(re *RouteEntry, reSys *RouteEntryBSD, ifs map[int]interface
 
 // populateDestination populates the 'Dst' field on a RouteEntry based on the
 // RouteMessage's destination and netmask fields.
-func populateDestination(re *RouteEntry, ifs map[int]interfaces.Interface, rm *route.RouteMessage) {
+func populateDestination(re *RouteEntry, ifs map[int]netmon.Interface, rm *route.RouteMessage) {
 	dst := rm.Addrs[unix.RTAX_DST]
 	if dst == nil {
 		return
@@ -186,7 +194,7 @@ func populateDestination(re *RouteEntry, ifs map[int]interfaces.Interface, rm *r
 
 // routeEntryFromMsg returns a RouteEntry from a single route.Message
 // returned by the operating system.
-func routeEntryFromMsg(ifsByIdx map[int]interfaces.Interface, msg route.Message) (RouteEntry, bool) {
+func routeEntryFromMsg(ifsByIdx map[int]netmon.Interface, msg route.Message) (RouteEntry, bool) {
 	rm, ok := msg.(*route.RouteMessage)
 	if !ok {
 		return RouteEntry{}, false
@@ -252,12 +260,12 @@ func routeEntryFromMsg(ifsByIdx map[int]interfaces.Interface, msg route.Message)
 func Get(max int) ([]RouteEntry, error) {
 	// Fetching the list of interfaces can race with fetching our route
 	// table, but we do it anyway since it's helpful for debugging.
-	ifs, err := interfaces.GetList()
+	ifs, err := netmon.GetInterfaceList()
 	if err != nil {
 		return nil, err
 	}
 
-	ifsByIdx := make(map[int]interfaces.Interface)
+	ifsByIdx := make(map[int]netmon.Interface)
 	for _, iif := range ifs {
 		ifsByIdx[iif.Index] = iif
 	}

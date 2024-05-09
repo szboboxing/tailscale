@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package ipn
 
@@ -9,24 +8,26 @@ import (
 	"strings"
 	"time"
 
+	"tailscale.com/drive"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/empty"
 	"tailscale.com/types/key"
 	"tailscale.com/types/netmap"
 	"tailscale.com/types/structs"
+	"tailscale.com/types/views"
 )
 
 type State int
 
 const (
-	NoState = State(iota)
-	InUseOtherUser
-	NeedsLogin
-	NeedsMachineAuth
-	Stopped
-	Starting
-	Running
+	NoState          State = 0
+	InUseOtherUser   State = 1
+	NeedsLogin       State = 2
+	NeedsMachineAuth State = 3
+	Stopped          State = 4
+	Starting         State = 5
+	Running          State = 6
 )
 
 // GoogleIDToken Type is the tailcfg.Oauth2Token.TokenType for the Google
@@ -52,6 +53,25 @@ type EngineStatus struct {
 	LivePeers      map[key.NodePublic]ipnstate.PeerStatusLite
 }
 
+// NotifyWatchOpt is a bitmask of options about what type of Notify messages
+// to subscribe to.
+type NotifyWatchOpt uint64
+
+const (
+	// NotifyWatchEngineUpdates, if set, causes Engine updates to be sent to the
+	// client either regularly or when they change, without having to ask for
+	// each one via Engine.RequestStatus.
+	NotifyWatchEngineUpdates NotifyWatchOpt = 1 << iota
+
+	NotifyInitialState  // if set, the first Notify message (sent immediately) will contain the current State + BrowseToURL + SessionID
+	NotifyInitialPrefs  // if set, the first Notify message (sent immediately) will contain the current Prefs
+	NotifyInitialNetMap // if set, the first Notify message (sent immediately) will contain the current NetMap
+
+	NotifyNoPrivateKeys        // if set, private keys that would normally be sent in updates are zeroed out
+	NotifyInitialDriveShares   // if set, the first Notify message (sent immediately) will contain the current Taildrive Shares
+	NotifyInitialOutgoingFiles // if set, the first Notify message (sent immediately) will contain the current Taildrop OutgoingFiles
+)
+
 // Notify is a communication from a backend (e.g. tailscaled) to a frontend
 // (cmd/tailscale, iOS, macOS, Win Tasktray).
 // In any given notification, any or all of these may be nil, meaning
@@ -60,6 +80,12 @@ type EngineStatus struct {
 type Notify struct {
 	_       structs.Incomparable
 	Version string // version number of IPN backend
+
+	// SessionID identifies the unique WatchIPNBus session.
+	// This field is only set in the first message when requesting
+	// NotifyInitialState. Clients must store it on their side as
+	// following notifications will not include this field.
+	SessionID string `json:",omitempty"`
 
 	// ErrMessage, if non-nil, contains a critical error message.
 	// For State InUseOtherUser, ErrMessage is not critical and just contains the details.
@@ -76,6 +102,8 @@ type Notify struct {
 	// FilesWaiting if non-nil means that files are buffered in
 	// the Tailscale daemon and ready for local transfer to the
 	// user's preferred storage location.
+	//
+	// Deprecated: use LocalClient.AwaitWaitingFiles instead.
 	FilesWaiting *empty.Message `json:",omitempty"`
 
 	// IncomingFiles, if non-nil, specifies which files are in the
@@ -83,13 +111,32 @@ type Notify struct {
 	// Notify should not update the state of file transfers. A non-nil
 	// but empty IncomingFiles means that no files are in the middle
 	// of being transferred.
+	//
+	// Deprecated: use LocalClient.AwaitWaitingFiles instead.
 	IncomingFiles []PartialFile `json:",omitempty"`
+
+	// OutgoingFiles, if non-nil, tracks which files are in the process of
+	// being sent via TailDrop, including files that finished, whether
+	// successful or failed. This slice is sorted by Started time, then Name.
+	OutgoingFiles []*OutgoingFile `json:",omitempty"`
 
 	// LocalTCPPort, if non-nil, informs the UI frontend which
 	// (non-zero) localhost TCP port it's listening on.
 	// This is currently only used by Tailscale when run in the
 	// macOS Network Extension.
 	LocalTCPPort *uint16 `json:",omitempty"`
+
+	// ClientVersion, if non-nil, describes whether a client version update
+	// is available.
+	ClientVersion *tailcfg.ClientVersion `json:",omitempty"`
+
+	// DriveShares tracks the full set of current DriveShares that we're
+	// publishing. Some client applications, like the MacOS and Windows clients,
+	// will listen for updates to this and handle serving these shares under
+	// the identity of the unprivileged user that is running the application. A
+	// nil value here means that we're not broadcasting shares information, an
+	// empty value means that there are no shares.
+	DriveShares views.SliceView[*drive.Share, drive.ShareView]
 
 	// type is mirrored in xcode/Shared/IPN.swift
 }
@@ -134,7 +181,7 @@ func (n Notify) String() string {
 	return s[0:len(s)-1] + "}"
 }
 
-// PartialFile represents an in-progress file transfer.
+// PartialFile represents an in-progress incoming file transfer.
 type PartialFile struct {
 	Name         string    // e.g. "foo.jpg"
 	Started      time.Time // time transfer started
@@ -145,6 +192,7 @@ type PartialFile struct {
 	// in-progress '*.partial' file's path when the peerapi isn't
 	// being used; see LocalBackend.SetDirectFileRoot.
 	PartialPath string `json:",omitempty"`
+	FinalPath   string `json:",omitempty"`
 
 	// Done is set in "direct" mode when the partial file has been
 	// closed and is ready for the caller to rename away the
@@ -152,22 +200,21 @@ type PartialFile struct {
 	Done bool `json:",omitempty"`
 }
 
+// OutgoingFile represents an in-progress outgoing file transfer.
+type OutgoingFile struct {
+	ID           string               `json:",omitempty"` // unique identifier for this transfer (a type 4 UUID)
+	PeerID       tailcfg.StableNodeID `json:",omitempty"` // identifier for the peer to which this is being transferred
+	Name         string               `json:",omitempty"` // e.g. "foo.jpg"
+	Started      time.Time            // time transfer started
+	DeclaredSize int64                // or -1 if unknown
+	Sent         int64                // bytes copied thus far
+	Finished     bool                 // indicates whether or not the transfer finished
+	Succeeded    bool                 // for a finished transfer, indicates whether or not it was successful
+}
+
 // StateKey is an opaque identifier for a set of LocalBackend state
-// (preferences, private keys, etc.).
-//
-// The reason we need this is that the Tailscale agent may be running
-// on a multi-user machine, in a context where a single daemon is
-// shared by several consecutive users. Ideally we would just use the
-// username of the connected frontend as the StateKey.
-//
-// Various platforms currently set StateKey in different ways:
-//
-//   - the macOS/iOS GUI apps set it to "ipn-go-bridge"
-//   - the Android app sets it to "ipn-android"
-//   - on Windows, it's the empty string (in client mode) or, via
-//     LocalBackend.userID, a string like "user-$USER_ID" (used in
-//     server mode).
-//   - on Linux/etc, it's always "_daemon" (ipn.GlobalDaemonStateKey)
+// (preferences, private keys, etc.). It is also used as a key for
+// the various LoginProfiles that the instance may be signed into.
 //
 // Additionally, the StateKey can be debug setting name:
 //
@@ -175,75 +222,23 @@ type PartialFile struct {
 //   - "_debug_<component>_until" with value being a unix timestamp stringified
 type StateKey string
 
+// DebuggableComponents is a list of components whose debugging can be turned on
+// and off individually using the tailscale debug command.
+var DebuggableComponents = []string{
+	"magicsock",
+	"sockstats",
+}
+
 type Options struct {
 	// FrontendLogID is the public logtail id used by the frontend.
 	FrontendLogID string
-	// StateKey and Prefs together define the state the backend should
-	// use:
-	//  - StateKey=="" && Prefs!=nil: use Prefs for internal state,
-	//    don't persist changes in the backend, except for the machine key
-	//    for migration purposes.
-	//  - StateKey!="" && Prefs==nil: load the given backend-side
-	//    state and use/update that.
-	//  - StateKey!="" && Prefs!=nil: like the previous case, but do
-	//    an initial overwrite of backend state with Prefs.
+	// UpdatePrefs, if provided, overrides the Prefs already stored in the
+	// backend state, *except* for the Persist member.
 	//
-	// NOTE(apenwarr): The above means that this Prefs field does not do
-	// what you probably think it does. It will overwrite your encryption
-	// keys. Do not use unless you know what you're doing.
-	StateKey StateKey
-	Prefs    *Prefs
-	// UpdatePrefs, if provided, overrides Options.Prefs *and* the Prefs
-	// already stored in the backend state, *except* for the Persist
-	// Persist member. If you just want to provide prefs, this is
-	// probably what you want.
-	//
-	// UpdatePrefs.Persist is always ignored. Prefs.Persist will still
-	// be used even if UpdatePrefs is provided. Other than Persist,
-	// UpdatePrefs takes precedence over Prefs.
-	//
-	// This is intended as a purely temporary workaround for the
-	// currently unexpected behaviour of Options.Prefs.
-	//
-	// TODO(apenwarr): Remove this, or rename Prefs to something else
-	//   and rename this to Prefs. Or, move Prefs.Persist elsewhere
-	//   entirely (as it always should have been), and then we wouldn't
-	//   need two separate fields at all. Or, move the fancy state
-	//   migration stuff out of Start().
+	// TODO(apenwarr): Rename this to Prefs, and possibly move Prefs.Persist
+	// elsewhere entirely (as it always should have been).
 	UpdatePrefs *Prefs
 	// AuthKey is an optional node auth key used to authorize a
 	// new node key without user interaction.
 	AuthKey string
-}
-
-// Backend is the interface between Tailscale frontends
-// (e.g. cmd/tailscale, iOS/MacOS/Windows GUIs) and the tailscale
-// backend (e.g. cmd/tailscaled) running on the same machine.
-// (It has nothing to do with the interface between the backends
-// and the cloud control plane.)
-type Backend interface {
-	// SetNotifyCallback sets the callback to be called on updates
-	// from the backend to the client.
-	SetNotifyCallback(func(Notify))
-	// Start starts or restarts the backend, typically when a
-	// frontend client connects.
-	Start(Options) error
-	// StartLoginInteractive requests to start a new interactive login
-	// flow. This should trigger a new BrowseToURL notification
-	// eventually.
-	StartLoginInteractive()
-	// Login logs in with an OAuth2 token.
-	Login(token *tailcfg.Oauth2Token)
-	// Logout terminates the current login session and stops the
-	// wireguard engine.
-	Logout()
-	// SetPrefs installs a new set of user preferences, including
-	// WantRunning. This may cause the wireguard engine to
-	// reconfigure or stop.
-	SetPrefs(*Prefs)
-	// RequestEngineStatus polls for an update from the wireguard
-	// engine. Only needed if you want to display byte
-	// counts. Connection events are emitted automatically without
-	// polling.
-	RequestEngineStatus()
 }

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package netcheck
 
@@ -19,11 +18,12 @@ import (
 	"testing"
 	"time"
 
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/stun"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
-	"tailscale.com/util/strs"
+	"tailscale.com/tstest"
+	"tailscale.com/tstest/nettest"
 )
 
 func TestHairpinSTUN(t *testing.T) {
@@ -48,19 +48,135 @@ func TestHairpinSTUN(t *testing.T) {
 	}
 }
 
+func TestHairpinWait(t *testing.T) {
+	makeClient := func(t *testing.T) (*Client, *reportState) {
+		tx := stun.NewTxID()
+		c := &Client{}
+		req := stun.Request(tx)
+		if !stun.Is(req) {
+			t.Fatal("expected STUN message")
+		}
+
+		var err error
+		rs := &reportState{
+			c:           c,
+			hairTX:      tx,
+			gotHairSTUN: make(chan netip.AddrPort, 1),
+			hairTimeout: make(chan struct{}),
+			report:      newReport(),
+		}
+		rs.pc4Hair, err = net.ListenUDP("udp4", &net.UDPAddr{
+			IP:   net.ParseIP("127.0.0.1"),
+			Port: 0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		c.curState = rs
+		return c, rs
+	}
+
+	ll, err := net.ListenPacket("udp", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ll.Close()
+	dstAddr := netip.MustParseAddrPort(ll.LocalAddr().String())
+
+	t.Run("Success", func(t *testing.T) {
+		c, rs := makeClient(t)
+		req := stun.Request(rs.hairTX)
+
+		// Start a hairpin check to ourselves.
+		rs.startHairCheckLocked(dstAddr)
+
+		// Fake receiving the stun check from ourselves after some period of time.
+		src := netip.MustParseAddrPort(rs.pc4Hair.LocalAddr().String())
+		c.handleHairSTUNLocked(req, src)
+
+		rs.waitHairCheck(context.Background())
+
+		// Verify that we set HairPinning
+		if got := rs.report.HairPinning; !got.EqualBool(true) {
+			t.Errorf("wanted HairPinning=true, got %v", got)
+		}
+	})
+
+	t.Run("LateReply", func(t *testing.T) {
+		c, rs := makeClient(t)
+		req := stun.Request(rs.hairTX)
+
+		// Start a hairpin check to ourselves.
+		rs.startHairCheckLocked(dstAddr)
+
+		// Wait until we've timed out, to mimic the race in #1795.
+		<-rs.hairTimeout
+
+		// Fake receiving the stun check from ourselves after some period of time.
+		src := netip.MustParseAddrPort(rs.pc4Hair.LocalAddr().String())
+		c.handleHairSTUNLocked(req, src)
+
+		// Wait for a hairpin response
+		rs.waitHairCheck(context.Background())
+
+		// Verify that we set HairPinning
+		if got := rs.report.HairPinning; !got.EqualBool(true) {
+			t.Errorf("wanted HairPinning=true, got %v", got)
+		}
+	})
+
+	t.Run("Timeout", func(t *testing.T) {
+		_, rs := makeClient(t)
+
+		// Start a hairpin check to ourselves.
+		rs.startHairCheckLocked(dstAddr)
+
+		ctx, cancel := context.WithTimeout(context.Background(), hairpinCheckTimeout*50)
+		defer cancel()
+
+		// Wait in the background
+		waitDone := make(chan struct{})
+		go func() {
+			rs.waitHairCheck(ctx)
+			close(waitDone)
+		}()
+
+		// If we do nothing, then we time out; confirm that we set
+		// HairPinning to false in this case.
+		select {
+		case <-waitDone:
+			if got := rs.report.HairPinning; !got.EqualBool(false) {
+				t.Errorf("wanted HairPinning=false, got %v", got)
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for hairpin channel")
+		}
+	})
+}
+
+func newTestClient(t testing.TB) *Client {
+	c := &Client{
+		NetMon: netmon.NewStatic(),
+		Logf:   t.Logf,
+	}
+	return c
+}
+
 func TestBasic(t *testing.T) {
 	stunAddr, cleanup := stuntest.Serve(t)
 	defer cleanup()
 
-	c := &Client{
-		Logf:        t.Logf,
-		UDPBindAddr: "127.0.0.1:0",
-	}
+	c := newTestClient(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	r, err := c.GetReport(ctx, stuntest.DERPMapOf(stunAddr.String()))
+	if err := c.Standalone(ctx, "127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := c.GetReport(ctx, stuntest.DERPMapOf(stunAddr.String()), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,13 +209,12 @@ func TestWorksWhenUDPBlocked(t *testing.T) {
 	dm := stuntest.DERPMapOf(stunAddr)
 	dm.Regions[1].Nodes[0].STUNOnly = true
 
-	c := &Client{
-		Logf: t.Logf,
-	}
+	c := newTestClient(t)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 
-	r, err := c.GetReport(ctx, dm)
+	r, err := c.GetReport(ctx, dm, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,13 +266,21 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 		}
 		return r
 	}
+	mkLDAFunc := func(mm map[int]time.Time) func(int) time.Time {
+		return func(region int) time.Time {
+			return mm[region]
+		}
+	}
 	type step struct {
 		after time.Duration
 		r     *Report
 	}
+	startTime := time.Unix(123, 0)
 	tests := []struct {
 		name        string
 		steps       []step
+		homeParams  *tailcfg.DERPHomeParams
+		opts        *GetReportOpts
 		wantDERP    int // want PreferredDERP on final step
 		wantPrevLen int // wanted len(c.prev)
 	}{
@@ -221,6 +344,15 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 			wantDERP:    1, // 2 didn't get fast enough
 		},
 		{
+			name: "preferred_derp_hysteresis_no_switch_absolute",
+			steps: []step{
+				{0 * time.Second, report("d1", 4*time.Millisecond, "d2", 5*time.Millisecond)},
+				{1 * time.Second, report("d1", 4*time.Millisecond, "d2", 1*time.Millisecond)},
+			},
+			wantPrevLen: 2,
+			wantDERP:    1, // 2 is 50%+ faster, but the absolute diff is <10ms
+		},
+		{
 			name: "preferred_derp_hysteresis_do_switch",
 			steps: []step{
 				{0 * time.Second, report("d1", 4, "d2", 5)},
@@ -229,16 +361,99 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 			wantPrevLen: 2,
 			wantDERP:    2, // 2 got fast enough
 		},
+		{
+			name: "derp_home_params",
+			homeParams: &tailcfg.DERPHomeParams{
+				RegionScore: map[int]float64{
+					1: 2.0 / 3, // 66%
+				},
+			},
+			steps: []step{
+				// We only use a single step here to avoid
+				// conflating DERP selection as a result of
+				// weight hints with the "stickiness" check
+				// that tries to not change the home DERP
+				// between steps.
+				{1 * time.Second, report("d1", 10, "d2", 8)},
+			},
+			wantPrevLen: 1,
+			wantDERP:    1, // 2 was faster, but not by 50%+
+		},
+		{
+			name: "derp_home_params_high_latency",
+			homeParams: &tailcfg.DERPHomeParams{
+				RegionScore: map[int]float64{
+					1: 2.0 / 3, // 66%
+				},
+			},
+			steps: []step{
+				// See derp_home_params for why this is a single step.
+				{1 * time.Second, report("d1", 100, "d2", 10)},
+			},
+			wantPrevLen: 1,
+			wantDERP:    2, // 2 was faster by more than 50%
+		},
+		{
+			name: "derp_home_params_invalid",
+			homeParams: &tailcfg.DERPHomeParams{
+				RegionScore: map[int]float64{
+					1: 0.0,
+					2: -1.0,
+				},
+			},
+			steps: []step{
+				{1 * time.Second, report("d1", 4, "d2", 5)},
+			},
+			wantPrevLen: 1,
+			wantDERP:    1,
+		},
+		{
+			name: "saw_derp_traffic",
+			steps: []step{
+				{0, report("d1", 2, "d2", 3)},               // (1) initially pick d1
+				{2 * time.Second, report("d1", 4, "d2", 3)}, // (2) still d1
+				{2 * time.Second, report("d2", 3)},          // (3) d1 gone, but have traffic
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
+					1: startTime.Add(2*time.Second + PreferredDERPFrameTime/2), // within active window of step (3)
+				}),
+			},
+			wantPrevLen: 3,
+			wantDERP:    1, // still on 1 since we got traffic from it
+		},
+		{
+			name: "saw_derp_traffic_history",
+			steps: []step{
+				{0, report("d1", 2, "d2", 3)},               // (1) initially pick d1
+				{2 * time.Second, report("d1", 4, "d2", 3)}, // (2) still d1
+				{2 * time.Second, report("d2", 3)},          // (3) d1 gone, but have traffic
+			},
+			opts: &GetReportOpts{
+				GetLastDERPActivity: mkLDAFunc(map[int]time.Time{
+					1: startTime.Add(4*time.Second - PreferredDERPFrameTime - 1), // not within active window of (3)
+				}),
+			},
+			wantPrevLen: 3,
+			wantDERP:    2, // moved to d2 since d1 is gone
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fakeTime := time.Unix(123, 0)
+			fakeTime := startTime
 			c := &Client{
 				TimeNow: func() time.Time { return fakeTime },
 			}
+			dm := &tailcfg.DERPMap{HomeParams: tt.homeParams}
+			rs := &reportState{
+				c:     c,
+				start: fakeTime,
+				opts:  tt.opts,
+			}
 			for _, s := range tt.steps {
 				fakeTime = fakeTime.Add(s.after)
-				c.addReportHistoryAndSetPreferredDERP(s.r)
+				rs.start = fakeTime.Add(-100 * time.Millisecond)
+				c.addReportHistoryAndSetPreferredDERP(rs, s.r, dm.View())
 			}
 			lastReport := tt.steps[len(tt.steps)-1].r
 			if got, want := len(c.prev), tt.wantPrevLen; got != want {
@@ -458,7 +673,7 @@ func TestMakeProbePlan(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ifState := &interfaces.State{
+			ifState := &netmon.State{
 				HaveV6: tt.have6if,
 				HaveV4: !tt.no4,
 			}
@@ -622,7 +837,7 @@ func TestLogConciseReport(t *testing.T) {
 			var buf bytes.Buffer
 			c := &Client{Logf: func(f string, a ...any) { fmt.Fprintf(&buf, f, a...) }}
 			c.logConciseReport(tt.r, dm)
-			if got, ok := strs.CutPrefix(buf.String(), "[v1] report: "); !ok {
+			if got, ok := strings.CutPrefix(buf.String(), "[v1] report: "); !ok {
 				t.Errorf("unexpected result.\n got: %#q\nwant: %#q\n", got, tt.want)
 			}
 		})
@@ -668,6 +883,8 @@ func TestSortRegions(t *testing.T) {
 }
 
 func TestNoCaptivePortalWhenUDP(t *testing.T) {
+	nettest.SkipIfNoNetwork(t) // empirically. not sure why.
+
 	// Override noRedirectClient to handle the /generate_204 endpoint
 	var generate204Called atomic.Bool
 	tr := RoundTripFunc(func(req *http.Request) *http.Response {
@@ -681,27 +898,25 @@ func TestNoCaptivePortalWhenUDP(t *testing.T) {
 		}
 	})
 
-	oldTransport := noRedirectClient.Transport
-	t.Cleanup(func() { noRedirectClient.Transport = oldTransport })
-	noRedirectClient.Transport = tr
+	tstest.Replace(t, &noRedirectClient.Transport, http.RoundTripper(tr))
 
 	stunAddr, cleanup := stuntest.Serve(t)
 	defer cleanup()
 
-	c := &Client{
-		Logf:              t.Logf,
-		UDPBindAddr:       "127.0.0.1:0",
-		testEnoughRegions: 1,
-
-		// Set the delay long enough that we have time to cancel it
-		// when our STUN probe succeeds.
-		testCaptivePortalDelay: 10 * time.Second,
-	}
+	c := newTestClient(t)
+	c.testEnoughRegions = 1
+	// Set the delay long enough that we have time to cancel it
+	// when our STUN probe succeeds.
+	c.testCaptivePortalDelay = 10 * time.Second
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
-	r, err := c.GetReport(ctx, stuntest.DERPMapOf(stunAddr.String()))
+	if err := c.Standalone(ctx, "127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := c.GetReport(ctx, stuntest.DERPMapOf(stunAddr.String()), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,4 +934,89 @@ type RoundTripFunc func(req *http.Request) *http.Response
 
 func (f RoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req), nil
+}
+
+func TestNodeAddrResolve(t *testing.T) {
+	nettest.SkipIfNoNetwork(t)
+	c := &Client{
+		Logf:        t.Logf,
+		UseDNSCache: true,
+	}
+
+	dn := &tailcfg.DERPNode{
+		Name:     "derptest1a",
+		RegionID: 901,
+		HostName: "tailscale.com",
+		// No IPv4 or IPv6 addrs
+	}
+	dnV4Only := &tailcfg.DERPNode{
+		Name:     "derptest1b",
+		RegionID: 901,
+		HostName: "ipv4.google.com",
+		// No IPv4 or IPv6 addrs
+	}
+
+	// Checks whether IPv6 and IPv6 DNS resolution works on this platform.
+	ipv6Works := func(t *testing.T) bool {
+		// Verify that we can create an IPv6 socket.
+		ln, err := net.ListenPacket("udp6", "[::1]:0")
+		if err != nil {
+			t.Logf("IPv6 may not work on this machine: %v", err)
+			return false
+		}
+		ln.Close()
+
+		// Resolve a hostname that we know has an IPv6 address.
+		addrs, err := net.DefaultResolver.LookupNetIP(context.Background(), "ip6", "google.com")
+		if err != nil {
+			t.Logf("IPv6 DNS resolution error: %v", err)
+			return false
+		}
+		if len(addrs) == 0 {
+			t.Logf("IPv6 DNS resolution returned no addresses")
+			return false
+		}
+		return true
+	}
+
+	ctx := context.Background()
+	for _, tt := range []bool{true, false} {
+		t.Run(fmt.Sprintf("UseDNSCache=%v", tt), func(t *testing.T) {
+			c.resolver = nil
+			c.UseDNSCache = tt
+
+			t.Run("IPv4", func(t *testing.T) {
+				ap := c.nodeAddr(ctx, dn, probeIPv4)
+				if !ap.IsValid() {
+					t.Fatal("expected valid AddrPort")
+				}
+				if !ap.Addr().Is4() {
+					t.Fatalf("expected IPv4 addr, got: %v", ap.Addr())
+				}
+				t.Logf("got IPv4 addr: %v", ap)
+			})
+			t.Run("IPv6", func(t *testing.T) {
+				// Skip if IPv6 doesn't work on this machine.
+				if !ipv6Works(t) {
+					t.Skipf("IPv6 may not work on this machine")
+				}
+
+				ap := c.nodeAddr(ctx, dn, probeIPv6)
+				if !ap.IsValid() {
+					t.Fatal("expected valid AddrPort")
+				}
+				if !ap.Addr().Is6() {
+					t.Fatalf("expected IPv6 addr, got: %v", ap.Addr())
+				}
+				t.Logf("got IPv6 addr: %v", ap)
+			})
+			t.Run("IPv6 Failure", func(t *testing.T) {
+				ap := c.nodeAddr(ctx, dnV4Only, probeIPv6)
+				if ap.IsValid() {
+					t.Fatalf("expected no addr but got: %v", ap)
+				}
+				t.Logf("correctly got invalid addr")
+			})
+		})
+	}
 }

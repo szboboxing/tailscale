@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package natlab
 
@@ -18,7 +17,7 @@ import (
 func TestAllocIPs(t *testing.T) {
 	n := NewInternet()
 	saw := map[netip.Addr]bool{}
-	for i := 0; i < 255; i++ {
+	for range 255 {
 		for _, f := range []func(*Interface) netip.Addr{n.allocIPv4, n.allocIPv6} {
 			ip := f(nil)
 			if saw[ip] {

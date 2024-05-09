@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package deephash
 
@@ -68,6 +67,7 @@ func TestTypeIsMemHashable(t *testing.T) {
 			false},
 		{[0]chan bool{}, true},
 		{struct{ f [0]func() }{}, true},
+		{&selfHasherPointerRecv{}, false},
 	}
 	for _, tt := range tests {
 		got := typeIsMemHashable(reflect.TypeOf(tt.val))
@@ -79,7 +79,7 @@ func TestTypeIsMemHashable(t *testing.T) {
 
 func TestTypeIsRecursive(t *testing.T) {
 	type RecursiveStruct struct {
-		v *RecursiveStruct
+		_ *RecursiveStruct
 	}
 	type RecursiveChan chan *RecursiveChan
 
@@ -103,6 +103,7 @@ func TestTypeIsRecursive(t *testing.T) {
 		{val: unsafe.Pointer(nil), want: false},
 		{val: make(RecursiveChan), want: true},
 		{val: make(chan int), want: false},
+		{val: (*selfHasherPointerRecv)(nil), want: false},
 	}
 	for _, tt := range tests {
 		got := typeIsRecursive(reflect.TypeOf(tt.val))

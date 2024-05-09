@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package key
 
@@ -156,5 +155,28 @@ func TestChallenge(t *testing.T) {
 	}
 	if back != pub {
 		t.Errorf("didn't round trip: %v != %v", back, pub)
+	}
+}
+
+// Test that NodePublic.Shard is uniformly distributed.
+func TestShard(t *testing.T) {
+	const N = 1_000
+	var shardCount [256]int
+	for range N {
+		shardCount[NewNode().Public().Shard()]++
+	}
+	e := float64(N) / 256 // expected
+	var x2 float64        // chi-squared
+	for _, c := range shardCount {
+		r := float64(c) - e // residual
+		x2 += r * r / e
+	}
+	t.Logf("x^2 = %v", x2)
+	if x2 > 512 { // really want x^2 =~ (256 - 1), but leave slop
+		t.Errorf("too much variation in shard distribution")
+		for i, c := range shardCount {
+			rj := float64(c) - e
+			t.Logf("shard[%v] = %v (off by %v)", i, c, rj)
+		}
 	}
 }

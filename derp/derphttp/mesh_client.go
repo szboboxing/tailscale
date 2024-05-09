@@ -1,11 +1,11 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package derphttp
 
 import (
 	"context"
+	"net/netip"
 	"sync"
 	"time"
 
@@ -14,25 +14,40 @@ import (
 	"tailscale.com/types/logger"
 )
 
-// RunWatchConnectionLoop loops until ctx is done, sending WatchConnectionChanges and subscribing to
-// connection changes.
+var retryInterval = 5 * time.Second
+
+// testHookWatchLookConnectResult, if non-nil for tests, is called by RunWatchConnectionLoop
+// with the connect result. If it returns false, the loop ends.
+var testHookWatchLookConnectResult func(connectError error, wasSelfConnect bool) (keepRunning bool)
+
+// RunWatchConnectionLoop loops until ctx is done, sending
+// WatchConnectionChanges and subscribing to connection changes.
 //
-// If the server's public key is ignoreServerKey, RunWatchConnectionLoop returns.
+// If the server's public key is ignoreServerKey, RunWatchConnectionLoop
+// returns.
 //
 // Otherwise, the add and remove funcs are called as clients come & go.
 //
-// infoLogf, if non-nil, is the logger to write periodic status
-// updates about how many peers are on the server. Error log output is
-// set to the c's logger, regardless of infoLogf's value.
+// infoLogf, if non-nil, is the logger to write periodic status updates about
+// how many peers are on the server. Error log output is set to the c's logger,
+// regardless of infoLogf's value.
 //
-// To force RunWatchConnectionLoop to return quickly, its ctx needs to
-// be closed, and c itself needs to be closed.
-func (c *Client) RunWatchConnectionLoop(ctx context.Context, ignoreServerKey key.NodePublic, infoLogf logger.Logf, add, remove func(key.NodePublic)) {
+// To force RunWatchConnectionLoop to return quickly, its ctx needs to be
+// closed, and c itself needs to be closed.
+//
+// It is a fatal error to call this on an already-started Client withoutq having
+// initialized Client.WatchConnectionChanges to true.
+func (c *Client) RunWatchConnectionLoop(ctx context.Context, ignoreServerKey key.NodePublic, infoLogf logger.Logf, add func(key.NodePublic, netip.AddrPort), remove func(key.NodePublic)) {
+	if !c.WatchConnectionChanges {
+		if c.isStarted() {
+			panic("invalid use of RunWatchConnectionLoop on already-started Client without setting Client.RunWatchConnectionLoop")
+		}
+		c.WatchConnectionChanges = true
+	}
 	if infoLogf == nil {
 		infoLogf = logger.Discard
 	}
 	logf := c.logf
-	const retryInterval = 5 * time.Second
 	const statusInterval = 10 * time.Second
 	var (
 		mu              sync.Mutex
@@ -52,7 +67,7 @@ func (c *Client) RunWatchConnectionLoop(ctx context.Context, ignoreServerKey key
 		present = map[key.NodePublic]bool{}
 	}
 	lastConnGen := 0
-	lastStatus := time.Now()
+	lastStatus := c.clock.Now()
 	logConnectedLocked := func() {
 		if loggedConnected {
 			return
@@ -62,16 +77,16 @@ func (c *Client) RunWatchConnectionLoop(ctx context.Context, ignoreServerKey key
 	}
 
 	const logConnectedDelay = 200 * time.Millisecond
-	timer := time.AfterFunc(2*time.Second, func() {
+	timer := c.clock.AfterFunc(2*time.Second, func() {
 		mu.Lock()
 		defer mu.Unlock()
 		logConnectedLocked()
 	})
 	defer timer.Stop()
 
-	updatePeer := func(k key.NodePublic, isPresent bool) {
+	updatePeer := func(k key.NodePublic, ipPort netip.AddrPort, isPresent bool) {
 		if isPresent {
-			add(k)
+			add(k, ipPort)
 		} else {
 			remove(k)
 		}
@@ -92,24 +107,30 @@ func (c *Client) RunWatchConnectionLoop(ctx context.Context, ignoreServerKey key
 	}
 
 	sleep := func(d time.Duration) {
-		t := time.NewTimer(d)
+		t, tChannel := c.clock.NewTimer(d)
 		select {
 		case <-ctx.Done():
 			t.Stop()
-		case <-t.C:
+		case <-tChannel:
 		}
 	}
 
 	for ctx.Err() == nil {
-		err := c.WatchConnectionChanges()
+		// Make sure we're connected before calling s.ServerPublicKey.
+		_, _, err := c.connect(ctx, "RunWatchConnectionLoop")
 		if err != nil {
-			clear()
-			logf("WatchConnectionChanges: %v", err)
+			if f := testHookWatchLookConnectResult; f != nil && !f(err, false) {
+				return
+			}
+			logf("mesh connect: %v", err)
 			sleep(retryInterval)
 			continue
 		}
-
-		if c.ServerPublicKey() == ignoreServerKey {
+		selfConnect := c.ServerPublicKey() == ignoreServerKey
+		if f := testHookWatchLookConnectResult; f != nil && !f(err, selfConnect) {
+			return
+		}
+		if selfConnect {
 			logf("detected self-connect; ignoring host")
 			return
 		}
@@ -127,13 +148,23 @@ func (c *Client) RunWatchConnectionLoop(ctx context.Context, ignoreServerKey key
 			}
 			switch m := m.(type) {
 			case derp.PeerPresentMessage:
-				updatePeer(key.NodePublic(m), true)
+				updatePeer(m.Key, m.IPPort, true)
 			case derp.PeerGoneMessage:
-				updatePeer(key.NodePublic(m), false)
+				switch m.Reason {
+				case derp.PeerGoneReasonDisconnected:
+					// Normal case, log nothing
+				case derp.PeerGoneReasonNotHere:
+					logf("Recv: peer %s not connected to %s",
+						key.NodePublic(m.Peer).ShortString(), c.ServerPublicKey().ShortString())
+				default:
+					logf("Recv: peer %s not at server %s for unknown reason %v",
+						key.NodePublic(m.Peer).ShortString(), c.ServerPublicKey().ShortString(), m.Reason)
+				}
+				updatePeer(key.NodePublic(m.Peer), netip.AddrPort{}, false)
 			default:
 				continue
 			}
-			if now := time.Now(); now.Sub(lastStatus) > statusInterval {
+			if now := c.clock.Now(); now.Sub(lastStatus) > statusInterval {
 				lastStatus = now
 				infoLogf("%d peers", len(present))
 			}

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package tsweb contains code used in various Tailscale webservers.
 package tsweb
@@ -8,20 +7,19 @@ package tsweb
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"expvar"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
-	"runtime"
-	"sort"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,26 +29,10 @@ import (
 	"tailscale.com/envknob"
 	"tailscale.com/metrics"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/tsweb/varz"
 	"tailscale.com/types/logger"
-	"tailscale.com/version"
+	"tailscale.com/util/vizerror"
 )
-
-func init() {
-	expvar.Publish("process_start_unix_time", expvar.Func(func() any { return timeStart.Unix() }))
-	expvar.Publish("version", expvar.Func(func() any { return version.Long }))
-	expvar.Publish("go_version", expvar.Func(func() any { return runtime.Version() }))
-	expvar.Publish("counter_uptime_sec", expvar.Func(func() any { return int64(Uptime().Seconds()) }))
-	expvar.Publish("gauge_goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
-}
-
-const (
-	gaugePrefix    = "gauge_"
-	counterPrefix  = "counter_"
-	labelMapPrefix = "labelmap_"
-)
-
-// prefixesToTrim contains key prefixes to remove when exporting and sorting metrics.
-var prefixesToTrim = []string{gaugePrefix, counterPrefix, labelMapPrefix}
 
 // DevMode controls whether extra output in shown, for when the binary is being run in dev mode.
 var DevMode bool
@@ -72,6 +54,9 @@ func IsProd443(addr string) bool {
 // AllowDebugAccess reports whether r should be permitted to access
 // various debug endpoints.
 func AllowDebugAccess(r *http.Request) bool {
+	if allowDebugAccessWithKey(r) {
+		return true
+	}
 	if r.Header.Get("X-Forwarded-For") != "" {
 		// TODO if/when needed. For now, conservative:
 		return false
@@ -87,14 +72,19 @@ func AllowDebugAccess(r *http.Request) bool {
 	if tsaddr.IsTailscaleIP(ip) || ip.IsLoopback() || ipStr == envknob.String("TS_ALLOW_DEBUG_IP") {
 		return true
 	}
-	if r.Method == "GET" {
-		urlKey := r.FormValue("debugkey")
-		keyPath := envknob.String("TS_DEBUG_KEY_PATH")
-		if urlKey != "" && keyPath != "" {
-			slurp, err := os.ReadFile(keyPath)
-			if err == nil && string(bytes.TrimSpace(slurp)) == urlKey {
-				return true
-			}
+	return false
+}
+
+func allowDebugAccessWithKey(r *http.Request) bool {
+	if r.Method != "GET" {
+		return false
+	}
+	urlKey := r.FormValue("debugkey")
+	keyPath := envknob.String("TS_DEBUG_KEY_PATH")
+	if urlKey != "" && keyPath != "" {
+		slurp, err := os.ReadFile(keyPath)
+		if err == nil && string(bytes.TrimSpace(slurp)) == urlKey {
+			return true
 		}
 	}
 	return false
@@ -141,10 +131,6 @@ func Protected(h http.Handler) http.Handler {
 	})
 }
 
-var timeStart = time.Now()
-
-func Uptime() time.Duration { return time.Since(timeStart).Round(time.Second) }
-
 // Port80Handler is the handler to be given to
 // autocert.Manager.HTTPHandler.  The inner handler is the mux
 // returned by NewMux containing registered /debug handlers.
@@ -170,10 +156,7 @@ func (h Port80Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Redirect authorized user to the debug handler.
 		path = "/debug/"
 	}
-	host := h.FQDN
-	if host == "" {
-		host = r.Host
-	}
+	host := cmp.Or(h.FQDN, r.Host)
 	target := "https://" + host + path
 	http.Redirect(w, r, target, http.StatusFound)
 }
@@ -194,6 +177,61 @@ type ReturnHandler interface {
 	ServeHTTPReturn(http.ResponseWriter, *http.Request) error
 }
 
+// BucketedStatsOptions describes tsweb handler options surrounding
+// the generation of metrics, grouped into buckets.
+type BucketedStatsOptions struct {
+	// Bucket returns which bucket the given request is in.
+	// If nil, [NormalizedPath] is used to compute the bucket.
+	Bucket func(req *http.Request) string
+
+	// If non-nil, Started maintains a counter of all requests which
+	// have begun processing.
+	Started *metrics.LabelMap
+
+	// If non-nil, Finished maintains a counter of all requests which
+	// have finished processing with success (that is, the HTTP handler has
+	// returned).
+	Finished *metrics.LabelMap
+}
+
+// normalizePathRegex matches components in a HTTP request path
+// that should be replaced.
+//
+// See: https://regex101.com/r/WIfpaR/3 for the explainer and test cases.
+var normalizePathRegex = regexp.MustCompile("([a-fA-F0-9]{9,}|([^\\/])+\\.([^\\/]){2,}|((n|k|u|L|t|S)[a-zA-Z0-9]{5,}(CNTRL|Djz1H|LV5CY|mxgaY|jNy1b))|(([^\\/])+\\@passkey))")
+
+// NormalizedPath returns the given path with the following modifications:
+//
+//   - any query parameters are removed
+//   - any path component with a hex string of 9 or more characters is
+//     replaced by an ellipsis
+//   - any path component containing a period with at least two characters
+//     after the period (i.e. an email or domain)
+//   - any path component consisting of a common Tailscale Stable ID
+//   - any path segment *@passkey.
+func NormalizedPath(p string) string {
+	// Fastpath: No hex sequences in there we might have to trim.
+	// Avoids allocating.
+	if normalizePathRegex.FindStringIndex(p) == nil {
+		b, _, _ := strings.Cut(p, "?")
+		return b
+	}
+
+	// If we got here, there's at least one hex sequences we need to
+	// replace with an ellipsis.
+	replaced := normalizePathRegex.ReplaceAllString(p, "…")
+	b, _, _ := strings.Cut(replaced, "?")
+	return b
+}
+
+func (o *BucketedStatsOptions) bucketForRequest(r *http.Request) string {
+	if o.Bucket != nil {
+		return o.Bucket(r)
+	}
+
+	return NormalizedPath(r.URL.Path)
+}
+
 type HandlerOptions struct {
 	QuietLoggingIfSuccessful bool // if set, do not log successfully handled HTTP requests (200 and 304 status codes)
 	Logf                     logger.Logf
@@ -207,6 +245,10 @@ type HandlerOptions struct {
 	// codes for handled responses.
 	// The keys are HTTP numeric response codes e.g. 200, 404, ...
 	StatusCodeCountersFull *expvar.Map
+
+	// If non-nil, BucketedStats computes and exposes statistics
+	// for each bucket based on the contained parameters.
+	BucketedStats *BucketedStatsOptions
 
 	// OnError is called if the handler returned a HTTPError. This
 	// is intended to be used to present pretty error pages if
@@ -222,6 +264,13 @@ type ErrorHandlerFunc func(http.ResponseWriter, *http.Request, HTTPError)
 // appropriate signature, ReturnHandlerFunc(f) is a ReturnHandler that
 // calls f.
 type ReturnHandlerFunc func(http.ResponseWriter, *http.Request) error
+
+// A Middleware is a function that wraps an http.Handler to extend or modify
+// its behaviour.
+//
+// The implementation of the wrapper is responsible for delegating its input
+// request to the underlying handler, if appropriate.
+type Middleware func(h http.Handler) http.Handler
 
 // ServeHTTPReturn calls f(w, r).
 func (f ReturnHandlerFunc) ServeHTTPReturn(w http.ResponseWriter, r *http.Request) error {
@@ -259,11 +308,62 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		RequestURI: r.URL.RequestURI(),
 		UserAgent:  r.UserAgent(),
 		Referer:    r.Referer(),
+		RequestID:  RequestIDFromContext(r.Context()),
+	}
+
+	var bucket string
+	var startRecorded bool
+	if bs := h.opts.BucketedStats; bs != nil {
+		bucket = bs.bucketForRequest(r)
+		if bs.Started != nil {
+			switch v := bs.Started.Map.Get(bucket).(type) {
+			case *expvar.Int:
+				// If we've already seen this bucket for, count it immediately.
+				// Otherwise, for newly seen paths, only count retroactively
+				// (so started-finished doesn't go negative) so we don't fill
+				// this LabelMap up with internet scanning spam.
+				v.Add(1)
+				startRecorded = true
+			}
+		}
 	}
 
 	lw := &loggingResponseWriter{ResponseWriter: w, logf: h.opts.Logf}
-	err := h.rh.ServeHTTPReturn(lw, r)
-	hErr, hErrOK := err.(HTTPError)
+
+	// In case the handler panics, we want to recover and continue logging the
+	// error before raising the panic again for the server to handle.
+	var (
+		didPanic bool
+		panicRes any
+	)
+	defer func() {
+		if didPanic {
+			panic(panicRes)
+		}
+	}()
+	runWithPanicProtection := func() (err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				didPanic = true
+				panicRes = r
+				// Even if r is an error, do not wrap it as an error here as
+				// that would allow things like panic(vizerror.New("foo")) which
+				// is really hard to define the behavior of.
+				err = fmt.Errorf("panic: %v", r)
+			}
+		}()
+		return h.rh.ServeHTTPReturn(lw, r)
+	}
+	err := runWithPanicProtection()
+
+	var hErr HTTPError
+	var hErrOK bool
+	if errors.As(err, &hErr) {
+		hErrOK = true
+	} else if vizErr, ok := vizerror.As(err); ok {
+		hErrOK = true
+		hErr = HTTPError{Msg: vizErr.Error()}
+	}
 
 	if lw.code == 0 && err == nil && !lw.hijacked {
 		// If the handler didn't write and didn't send a header, that still means 200.
@@ -316,14 +416,39 @@ func (h retHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			lw.WriteHeader(msg.Code)
 			fmt.Fprintln(lw, hErr.Msg)
+			if msg.RequestID != "" {
+				fmt.Fprintln(lw, msg.RequestID)
+			}
 		}
 	case err != nil:
+		const internalServerError = "internal server error"
+		errorMessage := internalServerError
+		if msg.RequestID != "" {
+			errorMessage += "\n" + string(msg.RequestID)
+		}
 		// Handler returned a generic error. Serve an internal server
 		// error, if necessary.
 		msg.Err = err.Error()
 		if lw.code == 0 {
 			msg.Code = http.StatusInternalServerError
-			http.Error(lw, "internal server error", msg.Code)
+			http.Error(lw, errorMessage, msg.Code)
+		}
+	}
+
+	if bs := h.opts.BucketedStats; bs != nil && bs.Finished != nil {
+		// Only increment metrics for buckets that result in good HTTP statuses
+		// or when we know the start was already counted.
+		// Otherwise they get full of internet scanning noise. Only filtering 404
+		// gets most of the way there but there are also plenty of URLs that are
+		// almost right but result in 400s too. Seem easier to just only ignore
+		// all 4xx and 5xx.
+		if startRecorded {
+			bs.Finished.Add(bucket, 1)
+		} else if msg.Code < 400 {
+			// This is the first non-error request for this bucket,
+			// so count it now retroactively.
+			bs.Started.Add(bucket, 1)
+			bs.Finished.Add(bucket, 1)
 		}
 	}
 
@@ -430,7 +555,6 @@ type HTTPError struct {
 
 // Error implements the error interface.
 func (e HTTPError) Error() string { return fmt.Sprintf("httperror{%d, %q, %v}", e.Code, e.Msg, e.Err) }
-
 func (e HTTPError) Unwrap() error { return e.Err }
 
 // Error returns an HTTPError containing the given information.
@@ -438,316 +562,113 @@ func Error(code int, msg string, err error) HTTPError {
 	return HTTPError{Code: code, Msg: msg, Err: err}
 }
 
-// PrometheusVar is a value that knows how to format itself into
-// Prometheus metric syntax.
-type PrometheusVar interface {
-	// WritePrometheus writes the value of the var to w, in Prometheus
-	// metric syntax. All variables names written out must start with
-	// prefix (or write out a single variable named exactly prefix)
-	WritePrometheus(w io.Writer, prefix string)
-}
-
-// WritePrometheusExpvar writes kv to w in Prometheus metrics format.
-//
-// See VarzHandler for conventions. This is exported primarily for
-// people to test their varz.
-func WritePrometheusExpvar(w io.Writer, kv expvar.KeyValue) {
-	writePromExpVar(w, "", kv)
-}
-
-func writePromExpVar(w io.Writer, prefix string, kv expvar.KeyValue) {
-	key := kv.Key
-	var typ string
-	var label string
-	switch {
-	case strings.HasPrefix(kv.Key, gaugePrefix):
-		typ = "gauge"
-		key = strings.TrimPrefix(kv.Key, gaugePrefix)
-
-	case strings.HasPrefix(kv.Key, counterPrefix):
-		typ = "counter"
-		key = strings.TrimPrefix(kv.Key, counterPrefix)
-	}
-	if strings.HasPrefix(key, labelMapPrefix) {
-		key = strings.TrimPrefix(key, labelMapPrefix)
-		if a, b, ok := strings.Cut(key, "_"); ok {
-			label, key = a, b
-		}
-	}
-	name := prefix + key
-
-	switch v := kv.Value.(type) {
-	case PrometheusVar:
-		v.WritePrometheus(w, name)
-		return
-	case *expvar.Int:
-		if typ == "" {
-			typ = "counter"
-		}
-		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, typ, name, v.Value())
-		return
-	case *expvar.Float:
-		if typ == "" {
-			typ = "gauge"
-		}
-		fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, typ, name, v.Value())
-		return
-	case *metrics.Set:
-		v.Do(func(kv expvar.KeyValue) {
-			writePromExpVar(w, name+"_", kv)
-		})
-		return
-	case PrometheusMetricsReflectRooter:
-		root := v.PrometheusMetricsReflectRoot()
-		rv := reflect.ValueOf(root)
-		if rv.Type().Kind() == reflect.Ptr {
-			if rv.IsNil() {
-				return
-			}
-			rv = rv.Elem()
-		}
-		if rv.Type().Kind() != reflect.Struct {
-			fmt.Fprintf(w, "# skipping expvar %q; unknown root type\n", name)
-			return
-		}
-		foreachExportedStructField(rv, func(fieldOrJSONName, metricType string, rv reflect.Value) {
-			mname := name + "_" + fieldOrJSONName
-			switch rv.Kind() {
-			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-				fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", mname, metricType, mname, rv.Int())
-			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
-				fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", mname, metricType, mname, rv.Uint())
-			case reflect.Float32, reflect.Float64:
-				fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", mname, metricType, mname, rv.Float())
-			case reflect.Struct:
-				if rv.CanAddr() {
-					// Slight optimization, not copying big structs if they're addressable:
-					writePromExpVar(w, name+"_", expvar.KeyValue{Key: fieldOrJSONName, Value: expVarPromStructRoot{rv.Addr().Interface()}})
-				} else {
-					writePromExpVar(w, name+"_", expvar.KeyValue{Key: fieldOrJSONName, Value: expVarPromStructRoot{rv.Interface()}})
-				}
-			}
-			return
-		})
-		return
-	}
-
-	if typ == "" {
-		var funcRet string
-		if f, ok := kv.Value.(expvar.Func); ok {
-			v := f()
-			if ms, ok := v.(runtime.MemStats); ok && name == "memstats" {
-				writeMemstats(w, &ms)
-				return
-			}
-			switch v := v.(type) {
-			case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, uintptr, float32, float64:
-				fmt.Fprintf(w, "%s %v\n", name, v)
-				return
-			}
-			funcRet = fmt.Sprintf(" returning %T", v)
-		}
-		switch kv.Value.(type) {
-		default:
-			fmt.Fprintf(w, "# skipping expvar %q (Go type %T%s) with undeclared Prometheus type\n", name, kv.Value, funcRet)
-			return
-		case *metrics.LabelMap, *expvar.Map:
-			// Permit typeless LabelMap and expvar.Map for
-			// compatibility with old expvar-registered
-			// metrics.LabelMap.
-		}
-	}
-
-	switch v := kv.Value.(type) {
-	case expvar.Func:
-		val := v()
-		switch val.(type) {
-		case float64, int64, int:
-			fmt.Fprintf(w, "# TYPE %s %s\n%s %v\n", name, typ, name, val)
-		default:
-			fmt.Fprintf(w, "# skipping expvar func %q returning unknown type %T\n", name, val)
-		}
-
-	case *metrics.LabelMap:
-		if typ != "" {
-			fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
-		}
-		// IntMap uses expvar.Map on the inside, which presorts
-		// keys. The output ordering is deterministic.
-		v.Do(func(kv expvar.KeyValue) {
-			fmt.Fprintf(w, "%s{%s=%q} %v\n", name, v.Label, kv.Key, kv.Value)
-		})
-	case *expvar.Map:
-		if label != "" && typ != "" {
-			fmt.Fprintf(w, "# TYPE %s %s\n", name, typ)
-			v.Do(func(kv expvar.KeyValue) {
-				fmt.Fprintf(w, "%s{%s=%q} %v\n", name, label, kv.Key, kv.Value)
-			})
-		} else {
-			v.Do(func(kv expvar.KeyValue) {
-				fmt.Fprintf(w, "%s_%s %v\n", name, kv.Key, kv.Value)
-			})
-		}
-	}
-}
-
-var sortedKVsPool = &sync.Pool{New: func() any { return new(sortedKVs) }}
-
-// sortedKV is a KeyValue with a sort key.
-type sortedKV struct {
-	expvar.KeyValue
-	sortKey string // KeyValue.Key with type prefix removed
-}
-
-type sortedKVs struct {
-	kvs []sortedKV
-}
-
-// VarzHandler is an HTTP handler to write expvar values into the
-// prometheus export format:
-//
-//	https://github.com/prometheus/docs/blob/master/content/docs/instrumenting/exposition_formats.md
-//
-// It makes the following assumptions:
-//
-//   - *expvar.Int are counters (unless marked as a gauge_; see below)
-//   - a *tailscale/metrics.Set is descended into, joining keys with
-//     underscores. So use underscores as your metric names.
-//   - an expvar named starting with "gauge_" or "counter_" is of that
-//     Prometheus type, and has that prefix stripped.
-//   - anything else is untyped and thus not exported.
-//   - expvar.Func can return an int or int64 (for now) and anything else
-//     is not exported.
-//
-// This will evolve over time, or perhaps be replaced.
+// VarzHandler writes expvar values as Prometheus metrics.
+// TODO: migrate all users to varz.Handler or promvarz.Handler and remove this.
 func VarzHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	varz.Handler(w, r)
+}
 
-	s := sortedKVsPool.Get().(*sortedKVs)
-	defer sortedKVsPool.Put(s)
-	s.kvs = s.kvs[:0]
-	expvarDo(func(kv expvar.KeyValue) {
-		s.kvs = append(s.kvs, sortedKV{kv, removeTypePrefixes(kv.Key)})
+// CleanRedirectURL ensures that urlStr is a valid redirect URL to the
+// current server, or one of allowedHosts. Returns the cleaned URL or
+// a validation error.
+func CleanRedirectURL(urlStr string, allowedHosts []string) (*url.URL, error) {
+	if urlStr == "" {
+		return &url.URL{}, nil
+	}
+	// In some places, we unfortunately query-escape the redirect URL
+	// too many times, and end up needing to redirect to a URL that's
+	// still escaped by one level. Try to unescape the input.
+	unescaped, err := url.QueryUnescape(urlStr)
+	if err == nil && unescaped != urlStr {
+		urlStr = unescaped
+	}
+
+	// Go's URL parser and browser URL parsers disagree on the meaning
+	// of malformed HTTP URLs. Given the input https:/evil.com, Go
+	// parses it as hostname="", path="/evil.com". Browsers parse it
+	// as hostname="evil.com", path="". This means that, using
+	// malformed URLs, an attacker could trick us into approving of a
+	// "local" redirect that in fact sends people elsewhere.
+	//
+	// This very blunt check enforces that we'll only process
+	// redirects that are definitely well-formed URLs.
+	//
+	// Note that the check for just / also allows URLs of the form
+	// "//foo.com/bar", which are scheme-relative redirects. These
+	// must be handled with care below when determining whether a
+	// redirect is relative to the current host. Notably,
+	// url.URL.IsAbs reports // URLs as relative, whereas we want to
+	// treat them as absolute redirects and verify the target host.
+	if !hasSafeRedirectPrefix(urlStr) {
+		return nil, fmt.Errorf("invalid redirect URL %q", urlStr)
+	}
+
+	url, err := url.Parse(urlStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid redirect URL %q: %w", urlStr, err)
+	}
+	// Redirects to self are always allowed. A self redirect must
+	// start with url.Path, all prior URL sections must be empty.
+	isSelfRedirect := url.Scheme == "" && url.Opaque == "" && url.User == nil && url.Host == ""
+	if isSelfRedirect {
+		return url, nil
+	}
+	for _, allowed := range allowedHosts {
+		if strings.EqualFold(allowed, url.Hostname()) {
+			return url, nil
+		}
+	}
+
+	return nil, fmt.Errorf("disallowed target host %q in redirect URL %q", url.Hostname(), urlStr)
+}
+
+// hasSafeRedirectPrefix reports whether url starts with a slash, or
+// one of the case-insensitive strings "http://" or "https://".
+func hasSafeRedirectPrefix(url string) bool {
+	if len(url) >= 1 && url[0] == '/' {
+		return true
+	}
+	const http = "http://"
+	if len(url) >= len(http) && strings.EqualFold(url[:len(http)], http) {
+		return true
+	}
+	const https = "https://"
+	if len(url) >= len(https) && strings.EqualFold(url[:len(https)], https) {
+		return true
+	}
+	return false
+}
+
+// AddBrowserHeaders sets various HTTP security headers for browser-facing endpoints.
+//
+// The specific headers:
+//   - require HTTPS access (HSTS)
+//   - disallow iframe embedding
+//   - mitigate MIME confusion attacks
+//
+// These headers are based on
+// https://infosec.mozilla.org/guidelines/web_security
+func AddBrowserHeaders(w http.ResponseWriter) {
+	w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'self'; block-all-mixed-content; object-src 'none'")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
+// BrowserHeaderHandler wraps the provided http.Handler with a call to
+// AddBrowserHeaders.
+func BrowserHeaderHandler(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		AddBrowserHeaders(w)
+		h.ServeHTTP(w, r)
 	})
-	sort.Slice(s.kvs, func(i, j int) bool {
-		return s.kvs[i].sortKey < s.kvs[j].sortKey
-	})
-	for _, e := range s.kvs {
-		writePromExpVar(w, "", e.KeyValue)
+}
+
+// BrowserHeaderHandlerFunc wraps the provided http.HandlerFunc with a call to
+// AddBrowserHeaders.
+func BrowserHeaderHandlerFunc(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		AddBrowserHeaders(w)
+		h.ServeHTTP(w, r)
 	}
 }
-
-// PrometheusMetricsReflectRooter is an optional interface that expvar.Var implementations
-// can implement to indicate that they should be walked recursively with reflect to find
-// sets of fields to export.
-type PrometheusMetricsReflectRooter interface {
-	expvar.Var
-
-	// PrometheusMetricsReflectRoot returns the struct or struct pointer to walk.
-	PrometheusMetricsReflectRoot() any
-}
-
-var expvarDo = expvar.Do // pulled out for tests
-
-func writeMemstats(w io.Writer, ms *runtime.MemStats) {
-	out := func(name, typ string, v uint64, help string) {
-		if help != "" {
-			fmt.Fprintf(w, "# HELP memstats_%s %s\n", name, help)
-		}
-		fmt.Fprintf(w, "# TYPE memstats_%s %s\nmemstats_%s %v\n", name, typ, name, v)
-	}
-	g := func(name string, v uint64, help string) { out(name, "gauge", v, help) }
-	c := func(name string, v uint64, help string) { out(name, "counter", v, help) }
-	g("heap_alloc", ms.HeapAlloc, "current bytes of allocated heap objects (up/down smoothly)")
-	c("total_alloc", ms.TotalAlloc, "cumulative bytes allocated for heap objects")
-	g("sys", ms.Sys, "total bytes of memory obtained from the OS")
-	c("mallocs", ms.Mallocs, "cumulative count of heap objects allocated")
-	c("frees", ms.Frees, "cumulative count of heap objects freed")
-	c("num_gc", uint64(ms.NumGC), "number of completed GC cycles")
-}
-
-// sortedStructField is metadata about a struct field used both for sorting once
-// (by structTypeSortedFields) and at serving time (by
-// foreachExportedStructField).
-type sortedStructField struct {
-	Index           int    // index of struct field in struct
-	Name            string // struct field name, or "json" name
-	SortName        string // Name with "foo_" type prefixes removed
-	MetricType      string // the "metrictype" struct tag
-	StructFieldType *reflect.StructField
-}
-
-var structSortedFieldsCache sync.Map // reflect.Type => []sortedStructField
-
-// structTypeSortedFields returns the sorted fields of t, caching as needed.
-func structTypeSortedFields(t reflect.Type) []sortedStructField {
-	if v, ok := structSortedFieldsCache.Load(t); ok {
-		return v.([]sortedStructField)
-	}
-	fields := make([]sortedStructField, 0, t.NumField())
-	for i, n := 0, t.NumField(); i < n; i++ {
-		sf := t.Field(i)
-		name := sf.Name
-		if v := sf.Tag.Get("json"); v != "" {
-			v, _, _ = strings.Cut(v, ",")
-			if v == "-" {
-				// Skip it, regardless of its metrictype.
-				continue
-			}
-			if v != "" {
-				name = v
-			}
-		}
-		fields = append(fields, sortedStructField{
-			Index:           i,
-			Name:            name,
-			SortName:        removeTypePrefixes(name),
-			MetricType:      sf.Tag.Get("metrictype"),
-			StructFieldType: &sf,
-		})
-	}
-	sort.Slice(fields, func(i, j int) bool {
-		return fields[i].SortName < fields[j].SortName
-	})
-	structSortedFieldsCache.Store(t, fields)
-	return fields
-}
-
-// removeTypePrefixes returns s with the first "foo_" prefix in prefixesToTrim
-// removed.
-func removeTypePrefixes(s string) string {
-	for _, prefix := range prefixesToTrim {
-		if trimmed := strings.TrimPrefix(s, prefix); trimmed != s {
-			return trimmed
-		}
-	}
-	return s
-}
-
-// foreachExportedStructField iterates over the fields in sorted order of
-// their name, after removing metric prefixes. This is not necessarily the
-// order they were declared in the struct
-func foreachExportedStructField(rv reflect.Value, f func(fieldOrJSONName, metricType string, rv reflect.Value)) {
-	t := rv.Type()
-	for _, ssf := range structTypeSortedFields(t) {
-		sf := ssf.StructFieldType
-		if ssf.MetricType != "" || sf.Type.Kind() == reflect.Struct {
-			f(ssf.Name, ssf.MetricType, rv.Field(ssf.Index))
-		} else if sf.Type.Kind() == reflect.Ptr && sf.Type.Elem().Kind() == reflect.Struct {
-			fv := rv.Field(ssf.Index)
-			if !fv.IsNil() {
-				f(ssf.Name, ssf.MetricType, fv.Elem())
-			}
-		}
-	}
-}
-
-type expVarPromStructRoot struct{ v any }
-
-func (r expVarPromStructRoot) PrometheusMetricsReflectRoot() any { return r.v }
-func (r expVarPromStructRoot) String() string                    { panic("unused") }
-
-var (
-	_ PrometheusMetricsReflectRooter = expVarPromStructRoot{}
-	_ expvar.Var                     = expVarPromStructRoot{}
-)

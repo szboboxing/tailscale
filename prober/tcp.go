@@ -1,6 +1,5 @@
-// Copyright (c) 2022 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package prober
 
@@ -13,9 +12,12 @@ import (
 // TCP returns a Probe that healthchecks a TCP endpoint.
 //
 // The ProbeFunc reports whether it can successfully connect to addr.
-func TCP(addr string) ProbeFunc {
-	return func(ctx context.Context) error {
-		return probeTCP(ctx, addr)
+func TCP(addr string) ProbeClass {
+	return ProbeClass{
+		Probe: func(ctx context.Context) error {
+			return probeTCP(ctx, addr)
+		},
+		Class: "tcp",
 	}
 }
 

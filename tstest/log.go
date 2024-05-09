@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package tstest
 
@@ -43,7 +42,9 @@ func (panicLogWriter) Write(b []byte) (int, error) {
 	// interfaces.GetState & tshttpproxy code to allow pushing
 	// down a Logger yet. TODO(bradfitz): do that refactoring once
 	// 1.2.0 is out.
-	if bytes.Contains(b, []byte("tshttpproxy: ")) {
+	if bytes.Contains(b, []byte("tshttpproxy: ")) ||
+		bytes.Contains(b, []byte("runtime/panic.go:")) ||
+		bytes.Contains(b, []byte("XXX")) {
 		os.Stderr.Write(b)
 		return len(b), nil
 	}
@@ -153,7 +154,7 @@ func WhileTestRunningLogger(t testing.TB) logger.Logf {
 		mu   sync.RWMutex
 		done bool
 	)
-
+	tlogf := logger.TestLogger(t)
 	logger := func(format string, args ...any) {
 		t.Helper()
 
@@ -163,7 +164,7 @@ func WhileTestRunningLogger(t testing.TB) logger.Logf {
 		if done {
 			return
 		}
-		t.Logf(format, args...)
+		tlogf(format, args...)
 	}
 
 	// t.Cleanup is run before the test is marked as done, so by acquiring

@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 // Package dnstype defines types for working with DNS.
 package dnstype
@@ -9,6 +8,7 @@ package dnstype
 
 import (
 	"net/netip"
+	"slices"
 )
 
 // Resolver is the configuration for one DNS resolver.
@@ -21,6 +21,8 @@ type Resolver struct {
 	//    as of 2022-09-08 only used for certain well-known resolvers
 	//    (see the publicdns package) for which the IP addresses to dial DoH are
 	//    known ahead of time, so bootstrap DNS resolution is not required.
+	//  - "http://node-address:port/path" for DNS over HTTP over WireGuard. This
+	//    is implemented in the PeerAPI for exit nodes and app connectors.
 	//  - [TODO] "tls://resolver.com" for DNS over TCP+TLS
 	Addr string `json:",omitempty"`
 
@@ -51,4 +53,16 @@ func (r *Resolver) IPPort() (ipp netip.AddrPort, ok bool) {
 		return ipp, true
 	}
 	return
+}
+
+// Equal reports whether r and other are equal.
+func (r *Resolver) Equal(other *Resolver) bool {
+	if r == nil || other == nil {
+		return r == other
+	}
+	if r == other {
+		return true
+	}
+
+	return r.Addr == other.Addr && slices.Equal(r.BootstrapResolution, other.BootstrapResolution)
 }

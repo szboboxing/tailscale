@@ -1,6 +1,5 @@
-// Copyright (c) 2021 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dnscache
 
@@ -19,9 +18,9 @@ import (
 )
 
 func TestMessageCache(t *testing.T) {
-	clock := &tstest.Clock{
+	clock := tstest.NewClock(tstest.ClockOpts{
 		Start: time.Date(1987, 11, 1, 0, 0, 0, 0, time.UTC),
-	}
+	})
 	mc := &MessageCache{Clock: clock.Now}
 	mc.SetMaxCacheSize(2)
 	clock.Advance(time.Second)

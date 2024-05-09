@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package wgengine
 
@@ -8,6 +7,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"tailscale.com/health"
 )
 
 func TestWatchdog(t *testing.T) {
@@ -22,7 +23,8 @@ func TestWatchdog(t *testing.T) {
 
 	t.Run("default watchdog does not fire", func(t *testing.T) {
 		t.Parallel()
-		e, err := NewFakeUserspaceEngine(t.Logf, 0)
+		ht := new(health.Tracker)
+		e, err := NewFakeUserspaceEngine(t.Logf, 0, ht)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,6 +1,5 @@
-// Copyright (c) 2020 Tailscale Inc & AUTHORS All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// Copyright (c) Tailscale Inc & AUTHORS
+// SPDX-License-Identifier: BSD-3-Clause
 
 package dns
 
@@ -10,12 +9,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/godbus/dbus/v5"
 	"tailscale.com/health"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/types/logger"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/cmpver"
 )
 
@@ -27,7 +29,9 @@ func (kv kv) String() string {
 	return fmt.Sprintf("%s=%s", kv.k, kv.v)
 }
 
-func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurator, err error) {
+var publishOnce sync.Once
+
+func NewOSConfigurator(logf logger.Logf, health *health.Tracker, interfaceName string) (ret OSConfigurator, err error) {
 	env := newOSConfigEnv{
 		fs:                directFS{},
 		dbusPing:          dbusPing,
@@ -36,39 +40,44 @@ func NewOSConfigurator(logf logger.Logf, interfaceName string) (ret OSConfigurat
 		nmVersionBetween:  nmVersionBetween,
 		resolvconfStyle:   resolvconfStyle,
 	}
-	mode, err := dnsMode(logf, env)
+	mode, err := dnsMode(logf, health, env)
 	if err != nil {
 		return nil, err
 	}
+	publishOnce.Do(func() {
+		sanitizedMode := strings.ReplaceAll(mode, "-", "_")
+		m := clientmetric.NewGauge(fmt.Sprintf("dns_manager_linux_mode_%s", sanitizedMode))
+		m.Set(1)
+	})
+	logf("dns: using %q mode", mode)
 	switch mode {
 	case "direct":
-		return newDirectManagerOnFS(logf, env.fs), nil
+		return newDirectManagerOnFS(logf, health, env.fs), nil
 	case "systemd-resolved":
-		return newResolvedManager(logf, interfaceName)
+		return newResolvedManager(logf, health, interfaceName)
 	case "network-manager":
 		return newNMManager(interfaceName)
 	case "debian-resolvconf":
 		return newDebianResolvconfManager(logf)
 	case "openresolv":
-		return newOpenresolvManager()
+		return newOpenresolvManager(logf)
 	default:
 		logf("[unexpected] detected unknown DNS mode %q, using direct manager as last resort", mode)
-		return newDirectManagerOnFS(logf, env.fs), nil
+		return newDirectManagerOnFS(logf, health, env.fs), nil
 	}
 }
 
 // newOSConfigEnv are the funcs newOSConfigurator needs, pulled out for testing.
 type newOSConfigEnv struct {
-	fs                        wholeFileFS
-	dbusPing                  func(string, string) error
-	dbusReadString            func(string, string, string, string) (string, error)
-	nmIsUsingResolved         func() error
-	nmVersionBetween          func(v1, v2 string) (safe bool, err error)
-	resolvconfStyle           func() string
-	isResolvconfDebianVersion func() bool
+	fs                wholeFileFS
+	dbusPing          func(string, string) error
+	dbusReadString    func(string, string, string, string) (string, error)
+	nmIsUsingResolved func() error
+	nmVersionBetween  func(v1, v2 string) (safe bool, err error)
+	resolvconfStyle   func() string
 }
 
-func dnsMode(logf logger.Logf, env newOSConfigEnv) (ret string, err error) {
+func dnsMode(logf logger.Logf, health *health.Tracker, env newOSConfigEnv) (ret string, err error) {
 	var debug []kv
 	dbg := func(k, v string) {
 		debug = append(debug, kv{k, v})
@@ -129,7 +138,7 @@ func dnsMode(logf logger.Logf, env newOSConfigEnv) (ret string, err error) {
 		// header, but doesn't actually point to resolved. We mustn't
 		// try to program resolved in that case.
 		// https://github.com/tailscale/tailscale/issues/2136
-		if err := resolvedIsActuallyResolver(bs); err != nil {
+		if err := resolvedIsActuallyResolver(logf, env, dbg, bs); err != nil {
 			logf("dns: resolvedIsActuallyResolver error: %v", err)
 			dbg("resolved", "not-in-use")
 			return "direct", nil
@@ -215,7 +224,7 @@ func dnsMode(logf logger.Logf, env newOSConfigEnv) (ret string, err error) {
 		dbg("rc", "nm")
 		// Sometimes, NetworkManager owns the configuration but points
 		// it at systemd-resolved.
-		if err := resolvedIsActuallyResolver(bs); err != nil {
+		if err := resolvedIsActuallyResolver(logf, env, dbg, bs); err != nil {
 			logf("dns: resolvedIsActuallyResolver error: %v", err)
 			dbg("resolved", "not-in-use")
 			// You'd think we would use newNMManager here. However, as
@@ -255,6 +264,13 @@ func dnsMode(logf logger.Logf, env newOSConfigEnv) (ret string, err error) {
 			dbg("nm-safe", "yes")
 			return "network-manager", nil
 		}
+		if err := env.nmIsUsingResolved(); err != nil {
+			// If systemd-resolved is not running at all, then we don't have any
+			// other choice: we take direct control of DNS.
+			dbg("nm-resolved", "no")
+			return "direct", nil
+		}
+
 		health.SetDNSManagerHealth(errors.New("systemd-resolved and NetworkManager are wired together incorrectly; MagicDNS will probably not work. For more info, see https://tailscale.com/s/resolved-nm"))
 		dbg("nm-safe", "no")
 		return "systemd-resolved", nil
@@ -308,14 +324,23 @@ func nmIsUsingResolved() error {
 	return nil
 }
 
-// resolvedIsActuallyResolver reports whether the given resolv.conf
-// bytes describe a configuration where systemd-resolved (127.0.0.53)
-// is the only configured nameserver.
+// resolvedIsActuallyResolver reports whether the system is using
+// systemd-resolved as the resolver. There are two different ways to
+// use systemd-resolved:
+//   - libnss_resolve, which requires adding `resolve` to the "hosts:"
+//     line in /etc/nsswitch.conf
+//   - setting the only nameserver configured in `resolv.conf` to
+//     systemd-resolved IP (127.0.0.53)
 //
 // Returns an error if the configuration is something other than
 // exclusively systemd-resolved, or nil if the config is only
 // systemd-resolved.
-func resolvedIsActuallyResolver(bs []byte) error {
+func resolvedIsActuallyResolver(logf logger.Logf, env newOSConfigEnv, dbg func(k, v string), bs []byte) error {
+	if err := isLibnssResolveUsed(env); err == nil {
+		dbg("resolved", "nss")
+		return nil
+	}
+
 	cfg, err := readResolv(bytes.NewBuffer(bs))
 	if err != nil {
 		return err
@@ -332,7 +357,32 @@ func resolvedIsActuallyResolver(bs []byte) error {
 			return fmt.Errorf("resolv.conf doesn't point to systemd-resolved; points to %v", cfg.Nameservers)
 		}
 	}
+	dbg("resolved", "file")
 	return nil
+}
+
+// isLibnssResolveUsed reports whether libnss_resolve is used
+// for resolving names. Returns nil if it is, and an error otherwise.
+func isLibnssResolveUsed(env newOSConfigEnv) error {
+	bs, err := env.fs.ReadFile("/etc/nsswitch.conf")
+	if err != nil {
+		return fmt.Errorf("reading /etc/resolv.conf: %w", err)
+	}
+	for _, line := range strings.Split(string(bs), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "hosts:" {
+			continue
+		}
+		for _, module := range fields[1:] {
+			if module == "dns" {
+				return fmt.Errorf("dns with a higher priority than libnss_resolve")
+			}
+			if module == "resolve" {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("libnss_resolve not used")
 }
 
 func dbusPing(name, objectPath string) error {
