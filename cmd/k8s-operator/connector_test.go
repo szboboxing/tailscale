@@ -8,15 +8,19 @@ package main
 import (
 	"context"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tstest"
+	"tailscale.com/util/mak"
 )
 
 func TestConnector(t *testing.T) {
@@ -29,7 +33,7 @@ func TestConnector(t *testing.T) {
 		},
 		TypeMeta: metav1.TypeMeta{
 			Kind:       tsapi.ConnectorKind,
-			APIVersion: "tailscale.io/v1alpha1",
+			APIVersion: "tailscale.com/v1alpha1",
 		},
 		Spec: tsapi.ConnectorSpec{
 			SubnetRouter: &tsapi.SubnetRouter{
@@ -73,9 +77,27 @@ func TestConnector(t *testing.T) {
 		hostname:     "test-connector",
 		isExitNode:   true,
 		subnetRoutes: "10.40.0.0/14",
+		app:          kubetypes.AppConnector,
 	}
-	expectEqual(t, fc, expectedSecret(t, opts), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+
+	// Connector status should get updated with the IP/hostname info when available.
+	const hostname = "foo.tailnetxyz.ts.net"
+	mustUpdate(t, fc, "operator-ns", opts.secretName, func(secret *corev1.Secret) {
+		mak.Set(&secret.Data, "device_id", []byte("1234"))
+		mak.Set(&secret.Data, "device_fqdn", []byte(hostname))
+		mak.Set(&secret.Data, "device_ips", []byte(`["127.0.0.1", "::1"]`))
+	})
+	expectReconciled(t, cr, "", "test")
+	cn.Finalizers = append(cn.Finalizers, "tailscale.com/finalizer")
+	cn.Status.IsExitNode = cn.Spec.ExitNode
+	cn.Status.SubnetRoutes = cn.Spec.SubnetRouter.AdvertiseRoutes.Stringify()
+	cn.Status.Hostname = hostname
+	cn.Status.TailnetIPs = []string{"127.0.0.1", "::1"}
+	expectEqual(t, fc, cn, func(o *tsapi.Connector) {
+		o.Status.Conditions = nil
+	})
 
 	// Add another route to be advertised.
 	mustUpdate[tsapi.Connector](t, fc, "", "test", func(conn *tsapi.Connector) {
@@ -151,8 +173,9 @@ func TestConnector(t *testing.T) {
 		parentType:   "connector",
 		subnetRoutes: "10.40.0.0/14",
 		hostname:     "test-connector",
+		app:          kubetypes.AppConnector,
 	}
-	expectEqual(t, fc, expectedSecret(t, opts), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
 
 	// Add an exit node.
@@ -236,8 +259,9 @@ func TestConnectorWithProxyClass(t *testing.T) {
 		hostname:     "test-connector",
 		isExitNode:   true,
 		subnetRoutes: "10.40.0.0/14",
+		app:          kubetypes.AppConnector,
 	}
-	expectEqual(t, fc, expectedSecret(t, opts), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
 
 	// 2. Update Connector to specify a ProxyClass. ProxyClass is not yet
@@ -254,9 +278,9 @@ func TestConnectorWithProxyClass(t *testing.T) {
 	// its resources.
 	mustUpdateStatus(t, fc, "", "custom-metadata", func(pc *tsapi.ProxyClass) {
 		pc.Status = tsapi.ProxyClassStatus{
-			Conditions: []tsapi.ConnectorCondition{{
+			Conditions: []metav1.Condition{{
 				Status:             metav1.ConditionTrue,
-				Type:               tsapi.ProxyClassready,
+				Type:               string(tsapi.ProxyClassReady),
 				ObservedGeneration: pc.Generation,
 			}}}
 	})
@@ -273,4 +297,101 @@ func TestConnectorWithProxyClass(t *testing.T) {
 	opts.proxyClass = ""
 	expectReconciled(t, cr, "", "test")
 	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+}
+
+func TestConnectorWithAppConnector(t *testing.T) {
+	// Setup
+	cn := &tsapi.Connector{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test",
+			UID:  types.UID("1234-UID"),
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind:       tsapi.ConnectorKind,
+			APIVersion: "tailscale.io/v1alpha1",
+		},
+		Spec: tsapi.ConnectorSpec{
+			AppConnector: &tsapi.AppConnector{},
+		},
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(tsapi.GlobalScheme).
+		WithObjects(cn).
+		WithStatusSubresource(cn).
+		Build()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl := tstest.NewClock(tstest.ClockOpts{})
+	fr := record.NewFakeRecorder(1)
+	cr := &ConnectorReconciler{
+		Client: fc,
+		clock:  cl,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger:   zl.Sugar(),
+		recorder: fr,
+	}
+
+	// 1. Connector with app connnector is created and becomes ready
+	expectReconciled(t, cr, "", "test")
+	fullName, shortName := findGenName(t, fc, "", "test", "connector")
+	opts := configOpts{
+		stsName:        shortName,
+		secretName:     fullName,
+		parentType:     "connector",
+		hostname:       "test-connector",
+		app:            kubetypes.AppConnector,
+		isAppConnector: true,
+	}
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
+	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+	// Connector's ready condition should be set to true
+
+	cn.ObjectMeta.Finalizers = append(cn.ObjectMeta.Finalizers, "tailscale.com/finalizer")
+	cn.Status.IsAppConnector = true
+	cn.Status.Conditions = []metav1.Condition{{
+		Type:               string(tsapi.ConnectorReady),
+		Status:             metav1.ConditionTrue,
+		LastTransitionTime: metav1.Time{Time: cl.Now().Truncate(time.Second)},
+		Reason:             reasonConnectorCreated,
+		Message:            reasonConnectorCreated,
+	}}
+	expectEqual(t, fc, cn, nil)
+
+	// 2. Connector with invalid app connector routes has status set to invalid
+	mustUpdate[tsapi.Connector](t, fc, "", "test", func(conn *tsapi.Connector) {
+		conn.Spec.AppConnector.Routes = tsapi.Routes{tsapi.Route("1.2.3.4/5")}
+	})
+	cn.Spec.AppConnector.Routes = tsapi.Routes{tsapi.Route("1.2.3.4/5")}
+	expectReconciled(t, cr, "", "test")
+	cn.Status.Conditions = []metav1.Condition{{
+		Type:               string(tsapi.ConnectorReady),
+		Status:             metav1.ConditionFalse,
+		LastTransitionTime: metav1.Time{Time: cl.Now().Truncate(time.Second)},
+		Reason:             reasonConnectorInvalid,
+		Message:            "Connector is invalid: route 1.2.3.4/5 has non-address bits set; expected 0.0.0.0/5",
+	}}
+	expectEqual(t, fc, cn, nil)
+
+	// 3. Connector with valid app connnector routes becomes ready
+	mustUpdate[tsapi.Connector](t, fc, "", "test", func(conn *tsapi.Connector) {
+		conn.Spec.AppConnector.Routes = tsapi.Routes{tsapi.Route("10.88.2.21/32")}
+	})
+	cn.Spec.AppConnector.Routes = tsapi.Routes{tsapi.Route("10.88.2.21/32")}
+	cn.Status.Conditions = []metav1.Condition{{
+		Type:               string(tsapi.ConnectorReady),
+		Status:             metav1.ConditionTrue,
+		LastTransitionTime: metav1.Time{Time: cl.Now().Truncate(time.Second)},
+		Reason:             reasonConnectorCreated,
+		Message:            reasonConnectorCreated,
+	}}
+	expectReconciled(t, cr, "", "test")
 }

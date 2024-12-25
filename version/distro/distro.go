@@ -6,13 +6,13 @@ package distro
 
 import (
 	"bytes"
-	"io"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"tailscale.com/types/lazy"
-	"tailscale.com/util/lineread"
+	"tailscale.com/util/lineiter"
 )
 
 type Distro string
@@ -31,6 +31,7 @@ const (
 	WDMyCloud = Distro("wdmycloud")
 	Unraid    = Distro("unraid")
 	Alpine    = Distro("alpine")
+	UDMPro    = Distro("udmpro")
 )
 
 var distro lazy.SyncValue[Distro]
@@ -76,6 +77,9 @@ func linuxDistro() Distro {
 	case have("/usr/local/bin/freenas-debug"):
 		// TrueNAS Scale runs on debian
 		return TrueNAS
+	case isUDMPro():
+		// UDM-Pro runs on debian
+		return UDMPro
 	case have("/etc/debian_version"):
 		return Debian
 	case have("/etc/arch-release"):
@@ -132,18 +136,60 @@ func DSMVersion() int {
 			return v
 		}
 		// But when run from the command line, we have to read it from the file:
-		lineread.File("/etc/VERSION", func(line []byte) error {
+		for lr := range lineiter.File("/etc/VERSION") {
+			line, err := lr.Value()
+			if err != nil {
+				break // but otherwise ignore
+			}
 			line = bytes.TrimSpace(line)
 			if string(line) == `majorversion="7"` {
-				v = 7
-				return io.EOF
+				return 7
 			}
 			if string(line) == `majorversion="6"` {
-				v = 6
-				return io.EOF
+				return 6
 			}
-			return nil
-		})
-		return v
+		}
+		return 0
 	})
+}
+
+// isUDMPro checks a couple of files known to exist on a UDM-Pro and returns
+// true if the expected content exists in the files.
+func isUDMPro() bool {
+	// This is a performance guardrail against trying to load both
+	// /etc/board.info and /sys/firmware/devicetree/base/soc/board-cfg/id when
+	// not running on Debian so we don't make unnecessary calls in situations
+	// where we definitely are NOT on a UDM Pro. In other words, the have() call
+	// is much cheaper than the two os.ReadFile() in fileContainsAnyString().
+	// That said, on Debian systems we will still be making the two
+	// os.ReadFile() in fileContainsAnyString().
+	if !have("/etc/debian_version") {
+		return false
+	}
+	if exists, err := fileContainsAnyString("/etc/board.info", "UDMPRO", "Dream Machine PRO"); err == nil && exists {
+		return true
+	}
+	if exists, err := fileContainsAnyString("/sys/firmware/devicetree/base/soc/board-cfg/id", "udm pro"); err == nil && exists {
+		return true
+	}
+	return false
+}
+
+// fileContainsAnyString is used to determine if one or more of the provided
+// strings exists in a file. This is not efficient for larger files. If you want
+// to use this function to parse large files, please refactor to use
+// `io.LimitedReader`.
+func fileContainsAnyString(filePath string, searchStrings ...string) (bool, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return false, err
+	}
+
+	content := string(data)
+	for _, searchString := range searchStrings {
+		if strings.Contains(content, searchString) {
+			return true, nil
+		}
+	}
+	return false, nil
 }

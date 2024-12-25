@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"go.uber.org/zap"
@@ -17,10 +18,14 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/net/dns/resolvconffile"
+	"tailscale.com/tstest"
+	"tailscale.com/tstime"
 	"tailscale.com/types/ptr"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/mak"
@@ -33,6 +38,7 @@ func TestLoadBalancerClass(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -42,11 +48,13 @@ func TestLoadBalancerClass(t *testing.T) {
 			operatorNamespace: "operator-ns",
 			proxyImage:        "tailscale/tailscale",
 		},
-		logger: zl.Sugar(),
+		logger:   zl.Sugar(),
+		clock:    clock,
+		recorder: record.NewFakeRecorder(100),
 	}
 
-	// Create a service that we should manage, and check that the initial round
-	// of objects looks right.
+	// Create a service that we should manage, but start with a miconfiguration
+	// in the annotations.
 	mustCreate(t, fc, &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
@@ -55,6 +63,9 @@ func TestLoadBalancerClass(t *testing.T) {
 			// doesn't. So, set it explicitly because other code later depends
 			// on it being set.
 			UID: types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetFQDN: "invalid.example.com",
+			},
 		},
 		Spec: corev1.ServiceSpec{
 			ClusterIP:         "10.20.30.40",
@@ -65,6 +76,46 @@ func TestLoadBalancerClass(t *testing.T) {
 
 	expectReconciled(t, sr, "default", "test")
 
+	// The expected value of .status.conditions[0].LastTransitionTime until the
+	// proxy becomes ready.
+	t0 := conditionTime(clock)
+
+	// Should have an error about invalid config.
+	want := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			UID:       types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetFQDN: "invalid.example.com",
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
+		},
+		Status: corev1.ServiceStatus{
+			Conditions: []metav1.Condition{{
+				Type:               string(tsapi.ProxyReady),
+				Status:             metav1.ConditionFalse,
+				LastTransitionTime: t0,
+				Reason:             reasonProxyInvalid,
+				Message:            `unable to provision proxy resources: invalid Service: invalid value of annotation tailscale.com/tailnet-fqdn: "invalid.example.com" does not appear to be a valid MagicDNS name`,
+			}},
+		},
+	}
+	expectEqual(t, fc, want, nil)
+
+	// Delete the misconfiguration so the proxy starts getting created on the
+	// next reconcile.
+	mustUpdate(t, fc, "default", "test", func(s *corev1.Service) {
+		s.ObjectMeta.Annotations = nil
+	})
+
+	clock.Advance(time.Second)
+	expectReconciled(t, sr, "default", "test")
+
 	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
 	opts := configOpts{
 		stsName:         shortName,
@@ -73,11 +124,25 @@ func TestLoadBalancerClass(t *testing.T) {
 		parentType:      "svc",
 		hostname:        "default-test",
 		clusterTargetIP: "10.20.30.40",
+		app:             kubetypes.AppIngressProxy,
 	}
 
-	expectEqual(t, fc, expectedSecret(t, opts), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+
+	want.Annotations = nil
+	want.ObjectMeta.Finalizers = []string{"tailscale.com/finalizer"}
+	want.Status = corev1.ServiceStatus{
+		Conditions: []metav1.Condition{{
+			Type:               string(tsapi.ProxyReady),
+			Status:             metav1.ConditionFalse,
+			LastTransitionTime: t0, // Status is still false, no update to transition time
+			Reason:             reasonProxyPending,
+			Message:            "no Tailscale hostname known yet, waiting for proxy pod to finish auth",
+		}},
+	}
+	expectEqual(t, fc, want, nil)
 
 	// Normally the Tailscale proxy pod would come up here and write its info
 	// into the secret. Simulate that, then verify reconcile again and verify
@@ -90,33 +155,16 @@ func TestLoadBalancerClass(t *testing.T) {
 		s.Data["device_fqdn"] = []byte("tailscale.device.name.")
 		s.Data["device_ips"] = []byte(`["100.99.98.97", "2c0a:8083:94d4:2012:3165:34a5:3616:5fdf"]`)
 	})
+	clock.Advance(time.Second)
 	expectReconciled(t, sr, "default", "test")
-	want := &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:       "test",
-			Namespace:  "default",
-			Finalizers: []string{"tailscale.com/finalizer"},
-			UID:        types.UID("1234-UID"),
-		},
-		Spec: corev1.ServiceSpec{
-			ClusterIP:         "10.20.30.40",
-			Type:              corev1.ServiceTypeLoadBalancer,
-			LoadBalancerClass: ptr.To("tailscale"),
-		},
-		Status: corev1.ServiceStatus{
-			LoadBalancer: corev1.LoadBalancerStatus{
-				Ingress: []corev1.LoadBalancerIngress{
-					{
-						Hostname: "tailscale.device.name",
-					},
-					{
-						IP: "100.99.98.97",
-					},
-				},
+	want.Status.Conditions = proxyCreatedCondition(clock)
+	want.Status.LoadBalancer = corev1.LoadBalancerStatus{
+		Ingress: []corev1.LoadBalancerIngress{
+			{
+				Hostname: "tailscale.device.name",
+			},
+			{
+				IP: "100.99.98.97",
 			},
 		},
 	}
@@ -144,11 +192,9 @@ func TestLoadBalancerClass(t *testing.T) {
 	expectMissing[appsv1.StatefulSet](t, fc, "operator-ns", shortName)
 	expectMissing[corev1.Service](t, fc, "operator-ns", shortName)
 	expectMissing[corev1.Secret](t, fc, "operator-ns", fullName)
+
+	// Note that the Tailscale-specific condition status should be gone now.
 	want = &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "default",
@@ -170,6 +216,7 @@ func TestTailnetTargetFQDNAnnotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	tailnetTargetFQDN := "foo.bar.ts.net."
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -180,6 +227,7 @@ func TestTailnetTargetFQDNAnnotation(t *testing.T) {
 			proxyImage:        "tailscale/tailscale",
 		},
 		logger: zl.Sugar(),
+		clock:  clock,
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -214,16 +262,13 @@ func TestTailnetTargetFQDNAnnotation(t *testing.T) {
 		parentType:        "svc",
 		tailnetTargetFQDN: tailnetTargetFQDN,
 		hostname:          "default-test",
+		app:               kubetypes.AppEgressProxy,
 	}
 
-	expectEqual(t, fc, expectedSecret(t, o), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, o), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 	want := &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test",
 			Namespace:  "default",
@@ -238,9 +283,12 @@ func TestTailnetTargetFQDNAnnotation(t *testing.T) {
 			Type:         corev1.ServiceTypeExternalName,
 			Selector:     nil,
 		},
+		Status: corev1.ServiceStatus{
+			Conditions: proxyCreatedCondition(clock),
+		},
 	}
 	expectEqual(t, fc, want, nil)
-	expectEqual(t, fc, expectedSecret(t, o), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, o), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 
@@ -280,6 +328,7 @@ func TestTailnetTargetIPAnnotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	tailnetTargetIP := "100.66.66.66"
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -290,6 +339,7 @@ func TestTailnetTargetIPAnnotation(t *testing.T) {
 			proxyImage:        "tailscale/tailscale",
 		},
 		logger: zl.Sugar(),
+		clock:  clock,
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -324,16 +374,13 @@ func TestTailnetTargetIPAnnotation(t *testing.T) {
 		parentType:      "svc",
 		tailnetTargetIP: tailnetTargetIP,
 		hostname:        "default-test",
+		app:             kubetypes.AppEgressProxy,
 	}
 
-	expectEqual(t, fc, expectedSecret(t, o), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, o), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 	want := &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test",
 			Namespace:  "default",
@@ -348,9 +395,12 @@ func TestTailnetTargetIPAnnotation(t *testing.T) {
 			Type:         corev1.ServiceTypeExternalName,
 			Selector:     nil,
 		},
+		Status: corev1.ServiceStatus{
+			Conditions: proxyCreatedCondition(clock),
+		},
 	}
 	expectEqual(t, fc, want, nil)
-	expectEqual(t, fc, expectedSecret(t, o), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, o), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 
@@ -382,6 +432,148 @@ func TestTailnetTargetIPAnnotation(t *testing.T) {
 	expectMissing[corev1.Secret](t, fc, "operator-ns", fullName)
 }
 
+func TestTailnetTargetIPAnnotation_IPCouldNotBeParsed(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger:   zl.Sugar(),
+		clock:    clock,
+		recorder: record.NewFakeRecorder(100),
+	}
+	tailnetTargetIP := "invalid-ip"
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+
+			UID: types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetIP: tailnetTargetIP,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	t0 := conditionTime(clock)
+
+	want := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			UID:       types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetIP: tailnetTargetIP,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
+		},
+		Status: corev1.ServiceStatus{
+			Conditions: []metav1.Condition{{
+				Type:               string(tsapi.ProxyReady),
+				Status:             metav1.ConditionFalse,
+				LastTransitionTime: t0,
+				Reason:             reasonProxyInvalid,
+				Message:            `unable to provision proxy resources: invalid Service: invalid value of annotation tailscale.com/tailnet-ip: "invalid-ip" could not be parsed as a valid IP Address, error: ParseAddr("invalid-ip"): unable to parse IP`,
+			}},
+		},
+	}
+
+	expectEqual(t, fc, want, nil)
+}
+
+func TestTailnetTargetIPAnnotation_InvalidIP(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger:   zl.Sugar(),
+		clock:    clock,
+		recorder: record.NewFakeRecorder(100),
+	}
+	tailnetTargetIP := "999.999.999.999"
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+
+			UID: types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetIP: tailnetTargetIP,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	t0 := conditionTime(clock)
+
+	want := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			UID:       types.UID("1234-UID"),
+			Annotations: map[string]string{
+				AnnotationTailnetTargetIP: tailnetTargetIP,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
+		},
+		Status: corev1.ServiceStatus{
+			Conditions: []metav1.Condition{{
+				Type:               string(tsapi.ProxyReady),
+				Status:             metav1.ConditionFalse,
+				LastTransitionTime: t0,
+				Reason:             reasonProxyInvalid,
+				Message:            `unable to provision proxy resources: invalid Service: invalid value of annotation tailscale.com/tailnet-ip: "999.999.999.999" could not be parsed as a valid IP Address, error: ParseAddr("999.999.999.999"): IPv4 field has value >255`,
+			}},
+		},
+	}
+
+	expectEqual(t, fc, want, nil)
+}
+
 func TestAnnotations(t *testing.T) {
 	fc := fake.NewFakeClient()
 	ft := &fakeTSClient{}
@@ -389,6 +581,7 @@ func TestAnnotations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -399,6 +592,7 @@ func TestAnnotations(t *testing.T) {
 			proxyImage:        "tailscale/tailscale",
 		},
 		logger: zl.Sugar(),
+		clock:  clock,
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -431,16 +625,13 @@ func TestAnnotations(t *testing.T) {
 		parentType:      "svc",
 		hostname:        "default-test",
 		clusterTargetIP: "10.20.30.40",
+		app:             kubetypes.AppIngressProxy,
 	}
 
-	expectEqual(t, fc, expectedSecret(t, o), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, o), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 	want := &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test",
 			Namespace:  "default",
@@ -453,6 +644,9 @@ func TestAnnotations(t *testing.T) {
 		Spec: corev1.ServiceSpec{
 			ClusterIP: "10.20.30.40",
 			Type:      corev1.ServiceTypeClusterIP,
+		},
+		Status: corev1.ServiceStatus{
+			Conditions: proxyCreatedCondition(clock),
 		},
 	}
 	expectEqual(t, fc, want, nil)
@@ -473,10 +667,6 @@ func TestAnnotations(t *testing.T) {
 	expectMissing[corev1.Service](t, fc, "operator-ns", shortName)
 	expectMissing[corev1.Secret](t, fc, "operator-ns", fullName)
 	want = &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "default",
@@ -497,6 +687,7 @@ func TestAnnotationIntoLB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -507,6 +698,7 @@ func TestAnnotationIntoLB(t *testing.T) {
 			proxyImage:        "tailscale/tailscale",
 		},
 		logger: zl.Sugar(),
+		clock:  clock,
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -539,9 +731,10 @@ func TestAnnotationIntoLB(t *testing.T) {
 		parentType:      "svc",
 		hostname:        "default-test",
 		clusterTargetIP: "10.20.30.40",
+		app:             kubetypes.AppIngressProxy,
 	}
 
-	expectEqual(t, fc, expectedSecret(t, o), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, o), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 
@@ -558,10 +751,6 @@ func TestAnnotationIntoLB(t *testing.T) {
 	})
 	expectReconciled(t, sr, "default", "test")
 	want := &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test",
 			Namespace:  "default",
@@ -574,6 +763,9 @@ func TestAnnotationIntoLB(t *testing.T) {
 		Spec: corev1.ServiceSpec{
 			ClusterIP: "10.20.30.40",
 			Type:      corev1.ServiceTypeClusterIP,
+		},
+		Status: corev1.ServiceStatus{
+			Conditions: proxyCreatedCondition(clock),
 		},
 	}
 	expectEqual(t, fc, want, nil)
@@ -592,10 +784,6 @@ func TestAnnotationIntoLB(t *testing.T) {
 	// ... but the service should have a LoadBalancer status.
 
 	want = &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test",
 			Namespace:  "default",
@@ -618,6 +806,7 @@ func TestAnnotationIntoLB(t *testing.T) {
 					},
 				},
 			},
+			Conditions: proxyCreatedCondition(clock),
 		},
 	}
 	expectEqual(t, fc, want, nil)
@@ -630,6 +819,7 @@ func TestLBIntoAnnotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -640,6 +830,7 @@ func TestLBIntoAnnotation(t *testing.T) {
 			proxyImage:        "tailscale/tailscale",
 		},
 		logger: zl.Sugar(),
+		clock:  clock,
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -670,9 +861,10 @@ func TestLBIntoAnnotation(t *testing.T) {
 		parentType:      "svc",
 		hostname:        "default-test",
 		clusterTargetIP: "10.20.30.40",
+		app:             kubetypes.AppIngressProxy,
 	}
 
-	expectEqual(t, fc, expectedSecret(t, o), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, o), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 
@@ -689,10 +881,6 @@ func TestLBIntoAnnotation(t *testing.T) {
 	})
 	expectReconciled(t, sr, "default", "test")
 	want := &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test",
 			Namespace:  "default",
@@ -715,6 +903,7 @@ func TestLBIntoAnnotation(t *testing.T) {
 					},
 				},
 			},
+			Conditions: proxyCreatedCondition(clock),
 		},
 	}
 	expectEqual(t, fc, want, nil)
@@ -740,10 +929,6 @@ func TestLBIntoAnnotation(t *testing.T) {
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 
 	want = &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test",
 			Namespace:  "default",
@@ -757,6 +942,9 @@ func TestLBIntoAnnotation(t *testing.T) {
 			ClusterIP: "10.20.30.40",
 			Type:      corev1.ServiceTypeClusterIP,
 		},
+		Status: corev1.ServiceStatus{
+			Conditions: proxyCreatedCondition(clock),
+		},
 	}
 	expectEqual(t, fc, want, nil)
 }
@@ -768,6 +956,7 @@ func TestCustomHostname(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -778,6 +967,7 @@ func TestCustomHostname(t *testing.T) {
 			proxyImage:        "tailscale/tailscale",
 		},
 		logger: zl.Sugar(),
+		clock:  clock,
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -811,16 +1001,13 @@ func TestCustomHostname(t *testing.T) {
 		parentType:      "svc",
 		hostname:        "reindeer-flotilla",
 		clusterTargetIP: "10.20.30.40",
+		app:             kubetypes.AppIngressProxy,
 	}
 
-	expectEqual(t, fc, expectedSecret(t, o), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, o), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 	want := &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       "test",
 			Namespace:  "default",
@@ -834,6 +1021,9 @@ func TestCustomHostname(t *testing.T) {
 		Spec: corev1.ServiceSpec{
 			ClusterIP: "10.20.30.40",
 			Type:      corev1.ServiceTypeClusterIP,
+		},
+		Status: corev1.ServiceStatus{
+			Conditions: proxyCreatedCondition(clock),
 		},
 	}
 	expectEqual(t, fc, want, nil)
@@ -854,10 +1044,6 @@ func TestCustomHostname(t *testing.T) {
 	expectMissing[corev1.Service](t, fc, "operator-ns", shortName)
 	expectMissing[corev1.Secret](t, fc, "operator-ns", fullName)
 	want = &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test",
 			Namespace: "default",
@@ -881,6 +1067,7 @@ func TestCustomPriorityClassName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -892,6 +1079,7 @@ func TestCustomPriorityClassName(t *testing.T) {
 			proxyPriorityClassName: "custom-priority-class-name",
 		},
 		logger: zl.Sugar(),
+		clock:  clock,
 	}
 
 	// Create a service that we should manage, and check that the initial round
@@ -926,6 +1114,7 @@ func TestCustomPriorityClassName(t *testing.T) {
 		hostname:          "tailscale-critical",
 		priorityClassName: "custom-priority-class-name",
 		clusterTargetIP:   "10.20.30.40",
+		app:               kubetypes.AppIngressProxy,
 	}
 
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
@@ -935,10 +1124,14 @@ func TestProxyClassForService(t *testing.T) {
 	// Setup
 	pc := &tsapi.ProxyClass{
 		ObjectMeta: metav1.ObjectMeta{Name: "custom-metadata"},
-		Spec: tsapi.ProxyClassSpec{StatefulSet: &tsapi.StatefulSet{
-			Labels:      map[string]string{"foo": "bar"},
-			Annotations: map[string]string{"bar.io/foo": "some-val"},
-			Pod:         &tsapi.Pod{Annotations: map[string]string{"foo.io/bar": "some-val"}}}},
+		Spec: tsapi.ProxyClassSpec{
+			TailscaleConfig: &tsapi.TailscaleConfig{
+				AcceptRoutes: true,
+			},
+			StatefulSet: &tsapi.StatefulSet{
+				Labels:      map[string]string{"foo": "bar"},
+				Annotations: map[string]string{"bar.io/foo": "some-val"},
+				Pod:         &tsapi.Pod{Annotations: map[string]string{"foo.io/bar": "some-val"}}}},
 	}
 	fc := fake.NewClientBuilder().
 		WithScheme(tsapi.GlobalScheme).
@@ -950,6 +1143,7 @@ func TestProxyClassForService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -960,6 +1154,7 @@ func TestProxyClassForService(t *testing.T) {
 			proxyImage:        "tailscale/tailscale",
 		},
 		logger: zl.Sugar(),
+		clock:  clock,
 	}
 
 	// 1. A new tailscale LoadBalancer Service is created without any
@@ -988,8 +1183,9 @@ func TestProxyClassForService(t *testing.T) {
 		parentType:      "svc",
 		hostname:        "default-test",
 		clusterTargetIP: "10.20.30.40",
+		app:             kubetypes.AppIngressProxy,
 	}
-	expectEqual(t, fc, expectedSecret(t, opts), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
 
@@ -1001,21 +1197,23 @@ func TestProxyClassForService(t *testing.T) {
 	})
 	expectReconciled(t, sr, "default", "test")
 	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
 
 	// 3. ProxyClass is set to Ready, the Service gets reconciled by the
 	// services-reconciler and the customization from the ProxyClass is
 	// applied to the proxy resources.
 	mustUpdateStatus(t, fc, "", "custom-metadata", func(pc *tsapi.ProxyClass) {
 		pc.Status = tsapi.ProxyClassStatus{
-			Conditions: []tsapi.ConnectorCondition{{
+			Conditions: []metav1.Condition{{
 				Status:             metav1.ConditionTrue,
-				Type:               tsapi.ProxyClassready,
+				Type:               string(tsapi.ProxyClassReady),
 				ObservedGeneration: pc.Generation,
 			}}}
 	})
 	opts.proxyClass = pc.Name
 	expectReconciled(t, sr, "default", "test")
 	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+	expectEqual(t, fc, expectedSecret(t, fc, opts), removeAuthKeyIfExistsModifier(t))
 
 	// 4. tailscale.com/proxy-class label is removed from the Service, the
 	// configuration from the ProxyClass is removed from the cluster
@@ -1035,6 +1233,7 @@ func TestDefaultLoadBalancer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -1045,6 +1244,7 @@ func TestDefaultLoadBalancer(t *testing.T) {
 			proxyImage:        "tailscale/tailscale",
 		},
 		logger:                zl.Sugar(),
+		clock:                 clock,
 		isDefaultLoadBalancer: true,
 	}
 
@@ -1077,6 +1277,7 @@ func TestDefaultLoadBalancer(t *testing.T) {
 		parentType:      "svc",
 		hostname:        "default-test",
 		clusterTargetIP: "10.20.30.40",
+		app:             kubetypes.AppIngressProxy,
 	}
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 
@@ -1089,6 +1290,7 @@ func TestProxyFirewallMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -1100,6 +1302,7 @@ func TestProxyFirewallMode(t *testing.T) {
 			tsFirewallMode:    "nftables",
 		},
 		logger:                zl.Sugar(),
+		clock:                 clock,
 		isDefaultLoadBalancer: true,
 	}
 
@@ -1131,6 +1334,7 @@ func TestProxyFirewallMode(t *testing.T) {
 		hostname:        "default-test",
 		firewallMode:    "nftables",
 		clusterTargetIP: "10.20.30.40",
+		app:             kubetypes.AppIngressProxy,
 	}
 	expectEqual(t, fc, expectedSTS(t, fc, o), removeHashAnnotation)
 }
@@ -1142,6 +1346,7 @@ func TestTailscaledConfigfileHash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -1152,6 +1357,7 @@ func TestTailscaledConfigfileHash(t *testing.T) {
 			proxyImage:        "tailscale/tailscale",
 		},
 		logger:                zl.Sugar(),
+		clock:                 clock,
 		isDefaultLoadBalancer: true,
 	}
 
@@ -1182,7 +1388,8 @@ func TestTailscaledConfigfileHash(t *testing.T) {
 		parentType:      "svc",
 		hostname:        "default-test",
 		clusterTargetIP: "10.20.30.40",
-		confFileHash:    "705e5ffd0bd5326237efdf542c850a65a54101284d5daa30775420fcc64d89c1",
+		confFileHash:    "acf3467364b0a3ba9b8ee0dd772cb7c2f0bf585e288fa99b7fe4566009ed6041",
+		app:             kubetypes.AppIngressProxy,
 	}
 	expectEqual(t, fc, expectedSTS(t, fc, o), nil)
 
@@ -1192,7 +1399,7 @@ func TestTailscaledConfigfileHash(t *testing.T) {
 		mak.Set(&svc.Annotations, AnnotationHostname, "another-test")
 	})
 	o.hostname = "another-test"
-	o.confFileHash = "1a087f887825d2b75d3673c7c2b0131f8ec1f0b1cb761d33e236dd28350dfe23"
+	o.confFileHash = "d4cc13f09f55f4f6775689004f9a466723325b84d2b590692796bfe22aeaa389"
 	expectReconciled(t, sr, "default", "test")
 	expectEqual(t, fc, expectedSTS(t, fc, o), nil)
 }
@@ -1422,6 +1629,72 @@ func Test_clusterDomainFromResolverConf(t *testing.T) {
 		})
 	}
 }
+func Test_authKeyRemoval(t *testing.T) {
+	fc := fake.NewFakeClient()
+	ft := &fakeTSClient{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. A new Service that should be exposed via Tailscale gets created, a Secret with a config that contains auth
+	// key is generated.
+	clock := tstest.NewClock(tstest.ClockOpts{})
+	sr := &ServiceReconciler{
+		Client: fc,
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
+		clock:  clock,
+	}
+
+	mustCreate(t, fc, &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+			UID:       types.UID("1234-UID"),
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:         "10.20.30.40",
+			Type:              corev1.ServiceTypeLoadBalancer,
+			LoadBalancerClass: ptr.To("tailscale"),
+		},
+	})
+
+	expectReconciled(t, sr, "default", "test")
+
+	fullName, shortName := findGenName(t, fc, "default", "test", "svc")
+	opts := configOpts{
+		stsName:         shortName,
+		secretName:      fullName,
+		namespace:       "default",
+		parentType:      "svc",
+		hostname:        "default-test",
+		clusterTargetIP: "10.20.30.40",
+		app:             kubetypes.AppIngressProxy,
+	}
+
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
+	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
+	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
+
+	// 2. Apply update to the Secret that imitates the proxy setting device_id.
+	s := expectedSecret(t, fc, opts)
+	mustUpdate(t, fc, s.Namespace, s.Name, func(s *corev1.Secret) {
+		mak.Set(&s.Data, "device_id", []byte("dkkdi4CNTRL"))
+	})
+
+	// 3. Config should no longer contain auth key
+	expectReconciled(t, sr, "default", "test")
+	opts.shouldRemoveAuthKey = true
+	opts.secretExtraData = map[string][]byte{"device_id": []byte("dkkdi4CNTRL")}
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
+}
 
 func Test_externalNameService(t *testing.T) {
 	fc := fake.NewFakeClient()
@@ -1433,6 +1706,7 @@ func Test_externalNameService(t *testing.T) {
 
 	// 1. A External name Service that should be exposed via Tailscale gets
 	// created.
+	clock := tstest.NewClock(tstest.ClockOpts{})
 	sr := &ServiceReconciler{
 		Client: fc,
 		ssr: &tailscaleSTSReconciler{
@@ -1443,6 +1717,7 @@ func Test_externalNameService(t *testing.T) {
 			proxyImage:        "tailscale/tailscale",
 		},
 		logger: zl.Sugar(),
+		clock:  clock,
 	}
 
 	// 1. Create an ExternalName Service that we should manage, and check that the initial round
@@ -1475,9 +1750,10 @@ func Test_externalNameService(t *testing.T) {
 		parentType:       "svc",
 		hostname:         "default-test",
 		clusterTargetDNS: "foo.com",
+		app:              kubetypes.AppIngressProxy,
 	}
 
-	expectEqual(t, fc, expectedSecret(t, opts), nil)
+	expectEqual(t, fc, expectedSecret(t, fc, opts), nil)
 	expectEqual(t, fc, expectedHeadlessService(shortName, "svc"), nil)
 	expectEqual(t, fc, expectedSTS(t, fc, opts), removeHashAnnotation)
 
@@ -1497,4 +1773,19 @@ func toFQDN(t *testing.T, s string) dnsname.FQDN {
 		t.Fatalf("error coverting %q to dnsname.FQDN: %v", s, err)
 	}
 	return fqdn
+}
+
+func proxyCreatedCondition(clock tstime.Clock) []metav1.Condition {
+	return []metav1.Condition{{
+		Type:               string(tsapi.ProxyReady),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 0,
+		LastTransitionTime: conditionTime(clock),
+		Reason:             reasonProxyCreated,
+		Message:            reasonProxyCreated,
+	}}
+}
+
+func conditionTime(clock tstime.Clock) metav1.Time {
+	return metav1.NewTime(clock.Now().Truncate(time.Second))
 }

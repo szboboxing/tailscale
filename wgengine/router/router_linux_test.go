@@ -19,14 +19,16 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/tailscale/netlink"
 	"github.com/tailscale/wireguard-go/tun"
-	"github.com/vishvananda/netlink"
 	"go4.org/netipx"
+	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/linuxfw"
+	"tailscale.com/version/distro"
 )
 
 func TestRouterStates(t *testing.T) {
@@ -369,7 +371,8 @@ ip route add throw 192.168.0.0/24 table 52` + basic,
 	defer mon.Close()
 
 	fake := NewFakeOS(t)
-	router, err := newUserspaceRouterAdvanced(t.Logf, "tailscale0", mon, fake)
+	ht := new(health.Tracker)
+	router, err := newUserspaceRouterAdvanced(t.Logf, "tailscale0", mon, fake, ht)
 	router.(*linuxRouter).nfr = fake.nfr
 	if err != nil {
 		t.Fatalf("failed to create router: %v", err)
@@ -528,11 +531,22 @@ func (n *fakeIPTablesRunner) DNATWithLoadBalancer(netip.Addr, []netip.Addr) erro
 	return errors.New("not implemented")
 }
 
-func (n *fakeIPTablesRunner) AddSNATRuleForDst(src, dst netip.Addr) error {
+func (n *fakeIPTablesRunner) EnsureSNATForDst(src, dst netip.Addr) error {
 	return errors.New("not implemented")
 }
 
 func (n *fakeIPTablesRunner) DNATNonTailscaleTraffic(exemptInterface string, dst netip.Addr) error {
+	return errors.New("not implemented")
+}
+func (n *fakeIPTablesRunner) EnsurePortMapRuleForSvc(svc, tun string, targetIP netip.Addr, pm linuxfw.PortMap) error {
+	return errors.New("not implemented")
+}
+
+func (n *fakeIPTablesRunner) DeletePortMapRuleForSvc(svc, tun string, targetIP netip.Addr, pm linuxfw.PortMap) error {
+	return errors.New("not implemented")
+}
+
+func (n *fakeIPTablesRunner) DeleteSvc(svc, tun string, targetIPs []netip.Addr, pm []linuxfw.PortMap) error {
 	return errors.New("not implemented")
 }
 
@@ -1217,4 +1231,25 @@ func adjustFwmask(t *testing.T, s string) string {
 	}
 
 	return fwmaskAdjustRe.ReplaceAllString(s, "$1")
+}
+
+func TestIPRulesForUDMPro(t *testing.T) {
+	// Override the global getDistroFunc
+	getDistroFunc = func() distro.Distro {
+		return distro.UDMPro
+	}
+	defer func() { getDistroFunc = distro.Get }() // Restore original after the test
+
+	expected := udmProIPRules
+	actual := ipRules()
+
+	if len(expected) != len(actual) {
+		t.Fatalf("Expected %d rules, got %d", len(expected), len(actual))
+	}
+
+	for i, rule := range expected {
+		if rule != actual[i] {
+			t.Errorf("Rule mismatch at index %d: expected %+v, got %+v", i, rule, actual[i])
+		}
+	}
 }

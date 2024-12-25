@@ -313,6 +313,9 @@ func (c *Client) preferIPv6() bool {
 var dialWebsocketFunc func(ctx context.Context, urlStr string) (net.Conn, error)
 
 func useWebsockets() bool {
+	if !canWebsockets {
+		return false
+	}
 	if runtime.GOOS == "js" {
 		return true
 	}
@@ -381,8 +384,9 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	}()
 
 	var node *tailcfg.DERPNode // nil when using c.url to dial
+	var idealNodeInRegion bool
 	switch {
-	case useWebsockets():
+	case canWebsockets && useWebsockets():
 		var urlStr string
 		if c.url != nil {
 			urlStr = c.url.String()
@@ -421,6 +425,7 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	default:
 		c.logf("%s: connecting to derp-%d (%v)", caller, reg.RegionID, reg.RegionCode)
 		tcpConn, node, err = c.dialRegion(ctx, reg)
+		idealNodeInRegion = err == nil && reg.Nodes[0] == node
 	}
 	if err != nil {
 		return nil, 0, err
@@ -494,6 +499,18 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	}
 	req.Header.Set("Upgrade", "DERP")
 	req.Header.Set("Connection", "Upgrade")
+	if !idealNodeInRegion && reg != nil {
+		// This is purely informative for now (2024-07-06) for stats:
+		req.Header.Set(derp.IdealNodeHeader, reg.Nodes[0].Name)
+		// TODO(bradfitz,raggi): start a time.AfterFunc for 30m-1h or so to
+		// dialNode(reg.Nodes[0]) and see if we can even TCP connect to it. If
+		// so, TLS handshake it as well (which is mixed up in this massive
+		// connect method) and then if it all appears good, grab the mutex, bump
+		// connGen, finish the Upgrade, close the old one, and set a new field
+		// on Client that's like "here's the connect result and connGen for the
+		// next connect that comes in"). Tracking bug for all this is:
+		// https://github.com/tailscale/tailscale/issues/12724
+	}
 
 	if !serverPub.IsZero() && serverProtoVersion != 0 {
 		// parseMetaCert found the server's public key (no TLS
@@ -740,6 +757,9 @@ func (c *Client) dialNode(ctx context.Context, n *tailcfg.DERPNode) (net.Conn, e
 			}
 			dst := cmp.Or(dstPrimary, n.HostName)
 			port := "443"
+			if !c.useHTTPS() {
+				port = "3340"
+			}
 			if n.DERPPort != 0 {
 				port = fmt.Sprint(n.DERPPort)
 			}

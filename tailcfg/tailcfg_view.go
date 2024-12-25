@@ -168,10 +168,8 @@ func (v NodeView) Online() *bool {
 func (v NodeView) MachineAuthorized() bool                   { return v.ж.MachineAuthorized }
 func (v NodeView) Capabilities() views.Slice[NodeCapability] { return views.SliceOf(v.ж.Capabilities) }
 
-func (v NodeView) CapMap() views.MapFn[NodeCapability, []RawMessage, views.Slice[RawMessage]] {
-	return views.MapFnOf(v.ж.CapMap, func(t []RawMessage) views.Slice[RawMessage] {
-		return views.SliceOf(t)
-	})
+func (v NodeView) CapMap() views.MapSlice[NodeCapability, RawMessage] {
+	return views.MapSliceOf(v.ж.CapMap)
 }
 func (v NodeView) UnsignedPeerAPIOnly() bool    { return v.ж.UnsignedPeerAPIOnly }
 func (v NodeView) ComputedName() string         { return v.ж.ComputedName }
@@ -320,6 +318,7 @@ func (v HostinfoView) Cloud() string                          { return v.ж.Clou
 func (v HostinfoView) Userspace() opt.Bool                    { return v.ж.Userspace }
 func (v HostinfoView) UserspaceRouter() opt.Bool              { return v.ж.UserspaceRouter }
 func (v HostinfoView) AppConnector() opt.Bool                 { return v.ж.AppConnector }
+func (v HostinfoView) ServicesHash() string                   { return v.ж.ServicesHash }
 func (v HostinfoView) Location() *Location {
 	if v.ж.Location == nil {
 		return nil
@@ -367,6 +366,7 @@ var _HostinfoViewNeedsRegeneration = Hostinfo(struct {
 	Userspace       opt.Bool
 	UserspaceRouter opt.Bool
 	AppConnector    opt.Bool
+	ServicesHash    string
 	Location        *Location
 }{})
 
@@ -1128,6 +1128,7 @@ func (v SSHRuleView) Principals() views.SliceView[*SSHPrincipal, SSHPrincipalVie
 
 func (v SSHRuleView) SSHUsers() views.Map[string, string] { return views.MapOf(v.ж.SSHUsers) }
 func (v SSHRuleView) Action() SSHActionView               { return v.ж.Action.View() }
+func (v SSHRuleView) AcceptEnv() views.Slice[string]      { return views.SliceOf(v.ж.AcceptEnv) }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _SSHRuleViewNeedsRegeneration = SSHRule(struct {
@@ -1135,6 +1136,7 @@ var _SSHRuleViewNeedsRegeneration = SSHRule(struct {
 	Principals  []*SSHPrincipal
 	SSHUsers    map[string]string
 	Action      *SSHAction
+	AcceptEnv   []string
 }{})
 
 // View returns a readonly view of SSHAction.
@@ -1258,19 +1260,21 @@ func (v *SSHPrincipalView) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (v SSHPrincipalView) Node() StableNodeID           { return v.ж.Node }
-func (v SSHPrincipalView) NodeIP() string               { return v.ж.NodeIP }
-func (v SSHPrincipalView) UserLogin() string            { return v.ж.UserLogin }
-func (v SSHPrincipalView) Any() bool                    { return v.ж.Any }
-func (v SSHPrincipalView) PubKeys() views.Slice[string] { return views.SliceOf(v.ж.PubKeys) }
+func (v SSHPrincipalView) Node() StableNodeID { return v.ж.Node }
+func (v SSHPrincipalView) NodeIP() string     { return v.ж.NodeIP }
+func (v SSHPrincipalView) UserLogin() string  { return v.ж.UserLogin }
+func (v SSHPrincipalView) Any() bool          { return v.ж.Any }
+func (v SSHPrincipalView) UnusedPubKeys() views.Slice[string] {
+	return views.SliceOf(v.ж.UnusedPubKeys)
+}
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _SSHPrincipalViewNeedsRegeneration = SSHPrincipal(struct {
-	Node      StableNodeID
-	NodeIP    string
-	UserLogin string
-	Any       bool
-	PubKeys   []string
+	Node          StableNodeID
+	NodeIP        string
+	UserLogin     string
+	Any           bool
+	UnusedPubKeys []string
 }{})
 
 // View returns a readonly view of ControlDialPlan.

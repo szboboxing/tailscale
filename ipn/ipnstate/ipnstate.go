@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"tailscale.com/tailcfg"
+	"tailscale.com/tka"
 	"tailscale.com/types/key"
 	"tailscale.com/types/ptr"
 	"tailscale.com/types/views"
@@ -25,7 +26,7 @@ import (
 	"tailscale.com/version"
 )
 
-//go:generate go run tailscale.com/cmd/cloner  -clonefunc=false -type=TKAFilteredPeer
+//go:generate go run tailscale.com/cmd/cloner  -clonefunc=false -type=TKAPeer
 
 // Status represents the entire state of the IPN network.
 type Status struct {
@@ -93,15 +94,14 @@ type TKAKey struct {
 	Votes    uint
 }
 
-// TKAFilteredPeer describes a peer which was removed from the netmap
-// (i.e. no connectivity) because it failed tailnet lock
-// checks.
-type TKAFilteredPeer struct {
-	Name         string // DNS
-	ID           tailcfg.NodeID
-	StableID     tailcfg.StableNodeID
-	TailscaleIPs []netip.Addr // Tailscale IP(s) assigned to this node
-	NodeKey      key.NodePublic
+// TKAPeer describes a peer and its network lock details.
+type TKAPeer struct {
+	Name             string // DNS
+	ID               tailcfg.NodeID
+	StableID         tailcfg.StableNodeID
+	TailscaleIPs     []netip.Addr // Tailscale IP(s) assigned to this node
+	NodeKey          key.NodePublic
+	NodeKeySignature tka.NodeKeySignature
 }
 
 // NetworkLockStatus represents whether network-lock is enabled,
@@ -126,14 +126,21 @@ type NetworkLockStatus struct {
 	// NodeKeySigned is true if our node is authorized by network-lock.
 	NodeKeySigned bool
 
+	// NodeKeySignature is the current signature of this node's key.
+	NodeKeySignature *tka.NodeKeySignature
+
 	// TrustedKeys describes the keys currently trusted to make changes
 	// to network-lock.
 	TrustedKeys []TKAKey
 
+	// VisiblePeers describes peers which are visible in the netmap that
+	// have valid Tailnet Lock signatures signatures.
+	VisiblePeers []*TKAPeer
+
 	// FilteredPeers describes peers which were removed from the netmap
 	// (i.e. no connectivity) because they failed tailnet lock
 	// checks.
-	FilteredPeers []*TKAFilteredPeer
+	FilteredPeers []*TKAPeer
 
 	// StateID is a nonce associated with the network lock authority,
 	// generated upon enablement. This field is not populated if the

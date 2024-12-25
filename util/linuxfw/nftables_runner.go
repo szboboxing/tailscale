@@ -41,8 +41,9 @@ type chainInfo struct {
 	chainPolicy   *nftables.ChainPolicy
 }
 
+// nftable contains nat and filter tables for the given IP family (Proto).
 type nftable struct {
-	Proto  nftables.TableFamily
+	Proto  nftables.TableFamily // IPv4 or IPv6
 	Filter *nftables.Table
 	Nat    *nftables.Table
 }
@@ -69,16 +70,18 @@ type nftable struct {
 //     https://wiki.nftables.org/wiki-nftables/index.php/Configuring_chains
 type nftablesRunner struct {
 	conn *nftables.Conn
-	nft4 *nftable
-	nft6 *nftable
+	nft4 *nftable // IPv4 tables, never nil
+	nft6 *nftable // IPv6 tables or nil if the system does not support IPv6
 
-	v6Available    bool
-	v6NATAvailable bool
+	v6Available bool // whether the host supports IPv6
 }
 
 func (n *nftablesRunner) ensurePreroutingChain(dst netip.Addr) (*nftables.Table, *nftables.Chain, error) {
 	polAccept := nftables.ChainPolicyAccept
-	table := n.getNFTByAddr(dst)
+	table, err := n.getNFTByAddr(dst)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error setting up nftables for IP family of %v: %w", dst, err)
+	}
 	nat, err := createTableIfNotExist(n.conn, table.Proto, "nat")
 	if err != nil {
 		return nil, nil, fmt.Errorf("error ensuring nat table: %w", err)
@@ -190,9 +193,12 @@ func (n *nftablesRunner) DNATNonTailscaleTraffic(tunname string, dst netip.Addr)
 	return n.conn.Flush()
 }
 
-func (n *nftablesRunner) AddSNATRuleForDst(src, dst netip.Addr) error {
+func (n *nftablesRunner) EnsureSNATForDst(src, dst netip.Addr) error {
 	polAccept := nftables.ChainPolicyAccept
-	table := n.getNFTByAddr(dst)
+	table, err := n.getNFTByAddr(dst)
+	if err != nil {
+		return fmt.Errorf("error setting up nftables for IP family of %v: %w", dst, err)
+	}
 	nat, err := createTableIfNotExist(n.conn, table.Proto, "nat")
 	if err != nil {
 		return fmt.Errorf("error ensuring nat table exists: %w", err)
@@ -210,44 +216,26 @@ func (n *nftablesRunner) AddSNATRuleForDst(src, dst netip.Addr) error {
 	if err != nil {
 		return fmt.Errorf("error ensuring postrouting chain: %w", err)
 	}
-	var daddrOffset, fam, daddrLen uint32
-	if dst.Is4() {
-		daddrOffset = 16
-		daddrLen = 4
-		fam = unix.NFPROTO_IPV4
-	} else {
-		daddrOffset = 24
-		daddrLen = 16
-		fam = unix.NFPROTO_IPV6
-	}
 
-	snatRule := &nftables.Rule{
-		Table: nat,
-		Chain: postRoutingCh,
-		Exprs: []expr.Any{
-			&expr.Payload{
-				DestRegister: 1,
-				Base:         expr.PayloadBaseNetworkHeader,
-				Offset:       daddrOffset,
-				Len:          daddrLen,
-			},
-			&expr.Cmp{
-				Op:       expr.CmpOpEq,
-				Register: 1,
-				Data:     dst.AsSlice(),
-			},
-			&expr.Immediate{
-				Register: 1,
-				Data:     src.AsSlice(),
-			},
-			&expr.NAT{
-				Type:       expr.NATTypeSourceNAT,
-				Family:     fam,
-				RegAddrMin: 1,
-			},
-		},
+	rules, err := n.conn.GetRules(nat, postRoutingCh)
+	if err != nil {
+		return fmt.Errorf("error listing rules: %w", err)
 	}
-	n.conn.AddRule(snatRule)
+	snatRulePrefixMatch := fmt.Sprintf("dst:%s,src:", dst.String())
+	snatRuleFullMatch := fmt.Sprintf("%s%s", snatRulePrefixMatch, src.String())
+	for _, rule := range rules {
+		current := string(rule.UserData)
+		if strings.HasPrefix(string(rule.UserData), snatRulePrefixMatch) {
+			if strings.EqualFold(current, snatRuleFullMatch) {
+				return nil // already exists, do nothing
+			}
+			if err := n.conn.DelRule(rule); err != nil {
+				return fmt.Errorf("error deleting SNAT rule: %w", err)
+			}
+		}
+	}
+	rule := snatRule(nat, postRoutingCh, src, dst, []byte(snatRuleFullMatch))
+	n.conn.AddRule(rule)
 	return n.conn.Flush()
 }
 
@@ -272,7 +260,10 @@ func (n *nftablesRunner) AddSNATRuleForDst(src, dst netip.Addr) error {
 // we don't want to race with wgengine for rule ordering within chains.
 func (n *nftablesRunner) ClampMSSToPMTU(tun string, addr netip.Addr) error {
 	polAccept := nftables.ChainPolicyAccept
-	table := n.getNFTByAddr(addr)
+	table, err := n.getNFTByAddr(addr)
+	if err != nil {
+		return fmt.Errorf("error setting up nftables for IP family of %v: %w", addr, err)
+	}
 	filterTable, err := createTableIfNotExist(n.conn, table.Proto, "filter")
 	if err != nil {
 		return fmt.Errorf("error ensuring filter table: %w", err)
@@ -548,17 +539,24 @@ type NetfilterRunner interface {
 	// in the Kubernetes ingress proxies.
 	DNATWithLoadBalancer(origDst netip.Addr, dsts []netip.Addr) error
 
-	// AddSNATRuleForDst adds a rule to the nat/POSTROUTING chain to SNAT
-	// traffic destined for dst to src.
+	// EnsureSNATForDst sets up firewall to mask the source for traffic destined for dst to src:
+	// - creates a SNAT rule if it doesn't already exist
+	// - deletes any pre-existing rules matching the destination
 	// This is used to forward traffic destined for the local machine over
 	// the Tailscale interface, as used in the Kubernetes egress proxies.
-	AddSNATRuleForDst(src, dst netip.Addr) error
+	EnsureSNATForDst(src, dst netip.Addr) error
 
 	// DNATNonTailscaleTraffic adds a rule to the nat/PREROUTING chain to DNAT
 	// all traffic inbound from any interface except exemptInterface to dst.
 	// This is used to forward traffic destined for the local machine over
 	// the Tailscale interface, as used in the Kubernetes egress proxies.
 	DNATNonTailscaleTraffic(exemptInterface string, dst netip.Addr) error
+
+	EnsurePortMapRuleForSvc(svc, tun string, targetIP netip.Addr, pm PortMap) error
+
+	DeletePortMapRuleForSvc(svc, tun string, targetIP netip.Addr, pm PortMap) error
+
+	DeleteSvc(svc, tun string, targetIPs []netip.Addr, pm []PortMap) error
 
 	// ClampMSSToPMTU adds a rule to the mangle/FORWARD chain to clamp MSS for
 	// traffic destined for the provided tun interface.
@@ -583,9 +581,23 @@ func New(logf logger.Logf, prefHint string) (NetfilterRunner, error) {
 	mode := detectFirewallMode(logf, prefHint)
 	switch mode {
 	case FirewallModeIPTables:
-		return newIPTablesRunner(logf)
+		// Note that we don't simply return an newIPTablesRunner here because it
+		// would return a `nil` iptablesRunner which is different from returning
+		// a nil NetfilterRunner.
+		ipr, err := newIPTablesRunner(logf)
+		if err != nil {
+			return nil, err
+		}
+		return ipr, nil
 	case FirewallModeNfTables:
-		return newNfTablesRunner(logf)
+		// Note that we don't simply return an newNfTablesRunner here because it
+		// would return a `nil` nftablesRunner which is different from returning
+		// a nil NetfilterRunner.
+		nfr, err := newNfTablesRunner(logf)
+		if err != nil {
+			return nil, err
+		}
+		return nfr, nil
 	default:
 		return nil, fmt.Errorf("unknown firewall mode %v", mode)
 	}
@@ -598,6 +610,10 @@ func newNfTablesRunner(logf logger.Logf) (*nftablesRunner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("nftables connection: %w", err)
 	}
+	return newNfTablesRunnerWithConn(logf, conn), nil
+}
+
+func newNfTablesRunnerWithConn(logf logger.Logf, conn *nftables.Conn) *nftablesRunner {
 	nft4 := &nftable{Proto: nftables.TableFamilyIPv4}
 
 	v6err := CheckIPv6(logf)
@@ -609,8 +625,8 @@ func newNfTablesRunner(logf logger.Logf) (*nftablesRunner, error) {
 
 	if supportsV6 {
 		nft6 = &nftable{Proto: nftables.TableFamilyIPv6}
-		logf("v6nat availability: true")
 	}
+	logf("netfilter running in nftables mode, v6 = %v", supportsV6)
 
 	// TODO(KevinLiang10): convert iptables rule to nftable rules if they exist in the iptables
 
@@ -619,7 +635,7 @@ func newNfTablesRunner(logf logger.Logf) (*nftablesRunner, error) {
 		nft4:        nft4,
 		nft6:        nft6,
 		v6Available: supportsV6,
-	}, nil
+	}
 }
 
 // newLoadSaddrExpr creates a new nftables expression that loads the source
@@ -782,17 +798,23 @@ func insertLoopbackRule(
 
 // getNFTByAddr returns the nftables with correct IP family
 // that we will be using for the given address.
-func (n *nftablesRunner) getNFTByAddr(addr netip.Addr) *nftable {
-	if addr.Is6() {
-		return n.nft6
+func (n *nftablesRunner) getNFTByAddr(addr netip.Addr) (*nftable, error) {
+	if addr.Is6() && !n.v6Available {
+		return nil, fmt.Errorf("nftables for IPv6 are not available on this host")
 	}
-	return n.nft4
+	if addr.Is6() {
+		return n.nft6, nil
+	}
+	return n.nft4, nil
 }
 
 // AddLoopbackRule adds an nftables rule to permit loopback traffic to
 // a local Tailscale IP. This rule is added only if it does not already exist.
 func (n *nftablesRunner) AddLoopbackRule(addr netip.Addr) error {
-	nf := n.getNFTByAddr(addr)
+	nf, err := n.getNFTByAddr(addr)
+	if err != nil {
+		return fmt.Errorf("error setting up nftables for IP family of %v: %w", addr, err)
+	}
 
 	inputChain, err := getChainFromTable(n.conn, nf.Filter, chainNameInput)
 	if err != nil {
@@ -809,7 +831,10 @@ func (n *nftablesRunner) AddLoopbackRule(addr netip.Addr) error {
 // DelLoopbackRule removes the nftables rule permitting loopback
 // traffic to a Tailscale IP.
 func (n *nftablesRunner) DelLoopbackRule(addr netip.Addr) error {
-	nf := n.getNFTByAddr(addr)
+	nf, err := n.getNFTByAddr(addr)
+	if err != nil {
+		return fmt.Errorf("error setting up nftables for IP family of %v: %w", addr, err)
+	}
 
 	inputChain, err := getChainFromTable(n.conn, nf.Filter, chainNameInput)
 	if err != nil {
@@ -837,20 +862,11 @@ func (n *nftablesRunner) DelLoopbackRule(addr netip.Addr) error {
 	return n.conn.Flush()
 }
 
-// getTables gets the available nftable in nftables runner.
+// getTables returns tables for IP families that this host was determined to
+// support (either IPv4 and IPv6 or just IPv4).
 func (n *nftablesRunner) getTables() []*nftable {
-	if n.v6Available {
+	if n.HasIPV6() {
 		return []*nftable{n.nft4, n.nft6}
-	}
-	return []*nftable{n.nft4}
-}
-
-// getNATTables gets the available nftable in nftables runner.
-// If the system does not support IPv6 NAT, only the IPv4 nftable
-// will be returned.
-func (n *nftablesRunner) getNATTables() []*nftable {
-	if n.v6NATAvailable {
-		return n.getTables()
 	}
 	return []*nftable{n.nft4}
 }
@@ -883,9 +899,7 @@ func (n *nftablesRunner) AddChains() error {
 		if err = createChainIfNotExist(n.conn, chainInfo{filter, chainNameInput, chainTypeRegular, nil, nil, nil}); err != nil {
 			return fmt.Errorf("create input chain: %w", err)
 		}
-	}
 
-	for _, table := range n.getNATTables() {
 		// Create the nat table if it doesn't exist, this table name is the same
 		// as the name used by iptables-nft and ufw. We install rules into the
 		// same conventional table so that `accept` verdicts from our jump
@@ -923,7 +937,7 @@ const (
 // can be used. It cleans up the dummy chains after creation.
 func (n *nftablesRunner) createDummyPostroutingChains() (retErr error) {
 	polAccept := ptr.To(nftables.ChainPolicyAccept)
-	for _, table := range n.getNATTables() {
+	for _, table := range n.getTables() {
 		nat, err := createTableIfNotExist(n.conn, table.Proto, tsDummyTableName)
 		if err != nil {
 			return fmt.Errorf("create nat table: %w", err)
@@ -980,7 +994,7 @@ func (n *nftablesRunner) DelChains() error {
 		return fmt.Errorf("delete chain: %w", err)
 	}
 
-	if n.v6NATAvailable {
+	if n.HasIPV6NAT() {
 		if err := deleteChainIfExists(n.conn, n.nft6.Nat, chainNamePostrouting); err != nil {
 			return fmt.Errorf("delete chain: %w", err)
 		}
@@ -1046,9 +1060,7 @@ func (n *nftablesRunner) AddHooks() error {
 		if err != nil {
 			return fmt.Errorf("Addhook: %w", err)
 		}
-	}
 
-	for _, table := range n.getNATTables() {
 		postroutingChain, err := getChainFromTable(conn, table.Nat, "POSTROUTING")
 		if err != nil {
 			return fmt.Errorf("get INPUT chain: %w", err)
@@ -1102,9 +1114,7 @@ func (n *nftablesRunner) DelHooks(logf logger.Logf) error {
 		if err != nil {
 			return fmt.Errorf("delhook: %w", err)
 		}
-	}
 
-	for _, table := range n.getNATTables() {
 		postroutingChain, err := getChainFromTable(conn, table.Nat, "POSTROUTING")
 		if err != nil {
 			return fmt.Errorf("get INPUT chain: %w", err)
@@ -1612,9 +1622,7 @@ func (n *nftablesRunner) DelBase() error {
 			return fmt.Errorf("get forward chain: %v", err)
 		}
 		conn.FlushChain(forwardChain)
-	}
 
-	for _, table := range n.getNATTables() {
 		postrouteChain, err := getChainFromTable(conn, table.Nat, chainNamePostrouting)
 		if err != nil {
 			return fmt.Errorf("get postrouting chain v4: %v", err)
@@ -1684,7 +1692,7 @@ func addMatchSubnetRouteMarkRule(conn *nftables.Conn, table *nftables.Table, cha
 func (n *nftablesRunner) AddSNATRule() error {
 	conn := n.conn
 
-	for _, table := range n.getNATTables() {
+	for _, table := range n.getTables() {
 		chain, err := getChainFromTable(conn, table.Nat, chainNamePostrouting)
 		if err != nil {
 			return fmt.Errorf("get postrouting chain v4: %w", err)
@@ -1727,7 +1735,7 @@ func (n *nftablesRunner) DelSNATRule() error {
 		&expr.Masq{},
 	}
 
-	for _, table := range n.getNATTables() {
+	for _, table := range n.getTables() {
 		chain, err := getChainFromTable(conn, table.Nat, chainNamePostrouting)
 		if err != nil {
 			return fmt.Errorf("get postrouting chain v4: %w", err)
@@ -1773,7 +1781,7 @@ func makeStatefulRuleExprs(tunname string) []expr.Any {
 		// going to our TUN.
 		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
 		&expr.Cmp{
-			Op:       expr.CmpOpNeq,
+			Op:       expr.CmpOpEq,
 			Register: 1,
 			Data:     []byte(tunname),
 		},
@@ -1926,7 +1934,7 @@ func (n *nftablesRunner) DelStatefulRule(tunname string) error {
 			return fmt.Errorf("get forward chain: %w", err)
 		}
 		rule, err := findRule(conn, &nftables.Rule{
-			Table: table.Nat,
+			Table: table.Filter,
 			Chain: chain,
 			Exprs: exprs,
 		})
@@ -2001,5 +2009,47 @@ func NfTablesCleanUp(logf logger.Logf) {
 		if table.Name == "nat" {
 			cleanupChain(logf, conn, table, "POSTROUTING", chainNamePostrouting)
 		}
+	}
+}
+
+func snatRule(t *nftables.Table, ch *nftables.Chain, src, dst netip.Addr, meta []byte) *nftables.Rule {
+	var daddrOffset, fam, daddrLen uint32
+	if dst.Is4() {
+		daddrOffset = 16
+		daddrLen = 4
+		fam = unix.NFPROTO_IPV4
+	} else {
+		daddrOffset = 24
+		daddrLen = 16
+		fam = unix.NFPROTO_IPV6
+	}
+
+	return &nftables.Rule{
+		Table: t,
+		Chain: ch,
+		Exprs: []expr.Any{
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       daddrOffset,
+				Len:          daddrLen,
+			},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     dst.AsSlice(),
+			},
+			&expr.Immediate{
+				Register: 1,
+				Data:     src.AsSlice(),
+			},
+			&expr.NAT{
+				Type:       expr.NATTypeSourceNAT,
+				Family:     fam,
+				RegAddrMin: 1,
+				RegAddrMax: 1,
+			},
+		},
+		UserData: meta,
 	}
 }

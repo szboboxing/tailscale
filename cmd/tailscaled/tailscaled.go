@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build go1.21
+//go:build go1.23
 
 // The tailscaled program is the Tailscale client daemon. It's configured
 // and controlled via the tailscale CLI program.
@@ -35,6 +35,7 @@ import (
 	"tailscale.com/control/controlclient"
 	"tailscale.com/drive/driveimpl"
 	"tailscale.com/envknob"
+	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/conffile"
 	"tailscale.com/ipn/ipnlocal"
@@ -118,7 +119,7 @@ var args struct {
 	tunname string
 
 	cleanUp        bool
-	confFile       string
+	confFile       string // empty, file path, or "vm:user-data"
 	debug          string
 	port           uint16
 	statepath      string
@@ -154,9 +155,11 @@ var beCLI func() // non-nil if CLI is linked in
 func main() {
 	envknob.PanicIfAnyEnvCheckedInInit()
 	envknob.ApplyDiskConfig()
+	applyIntegrationTestEnvKnob()
 
+	defaultVerbosity := envknob.RegisterInt("TS_LOG_VERBOSITY")
 	printVersion := false
-	flag.IntVar(&args.verbose, "verbose", 0, "log verbosity level; 0 is default, 1 or higher are increasingly verbose")
+	flag.IntVar(&args.verbose, "verbose", defaultVerbosity(), "log verbosity level; 0 is default, 1 or higher are increasingly verbose")
 	flag.BoolVar(&args.cleanUp, "cleanup", false, "clean up system state and exit")
 	flag.StringVar(&args.debug, "debug", "", "listen address ([ip]:port) of optional debug server")
 	flag.StringVar(&args.socksAddr, "socks5-server", "", `optional [ip]:port to run a SOCK5 server (e.g. "localhost:1080")`)
@@ -169,7 +172,7 @@ func main() {
 	flag.StringVar(&args.birdSocketPath, "bird-socket", "", "path of the bird unix socket")
 	flag.BoolVar(&printVersion, "version", false, "print version information and exit")
 	flag.BoolVar(&args.disableLogs, "no-logs-no-support", false, "disable log uploads; this also disables any technical support")
-	flag.StringVar(&args.confFile, "config", "", "path to config file")
+	flag.StringVar(&args.confFile, "config", "", "path to config file, or 'vm:user-data' to use the VM's user-data (EC2)")
 
 	if len(os.Args) > 0 && filepath.Base(os.Args[0]) == "tailscale" && beCLI != nil {
 		beCLI()
@@ -394,7 +397,7 @@ func run() (err error) {
 	// Always clean up, even if we're going to run the server. This covers cases
 	// such as when a system was rebooted without shutting down, or tailscaled
 	// crashed, and would for example restore system DNS configuration.
-	dns.CleanUp(logf, netMon, args.tunname)
+	dns.CleanUp(logf, netMon, sys.HealthTracker(), args.tunname)
 	router.CleanUp(logf, netMon, args.tunname)
 	// If the cleanUp flag was passed, then exit.
 	if args.cleanUp {
@@ -413,6 +416,10 @@ func run() (err error) {
 	}
 
 	sys.Set(driveimpl.NewFileSystemForRemote(logf))
+
+	if app := envknob.App(); app != "" {
+		hostinfo.SetApp(app)
+	}
 
 	return startIPNServer(context.Background(), logf, pol.PublicID, sys)
 }
@@ -548,13 +555,24 @@ func getLocalBackend(ctx context.Context, logf logger.Logf, logID logid.PublicID
 			return ok
 		}
 		dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-			// Note: don't just return ns.DialContextTCP or we'll
-			// return an interface containing a nil pointer.
+			// Note: don't just return ns.DialContextTCP or we'll return
+			// *gonet.TCPConn(nil) instead of a nil interface which trips up
+			// callers.
 			tcpConn, err := ns.DialContextTCP(ctx, dst)
 			if err != nil {
 				return nil, err
 			}
 			return tcpConn, nil
+		}
+		dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+			// Note: don't just return ns.DialContextUDP or we'll return
+			// *gonet.UDPConn(nil) instead of a nil interface which trips up
+			// callers.
+			udpConn, err := ns.DialContextUDP(ctx, dst)
+			if err != nil {
+				return nil, err
+			}
+			return udpConn, nil
 		}
 	}
 	if socksListener != nil || httpProxyListener != nil {
@@ -662,11 +680,14 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 		ListenPort:    args.port,
 		NetMon:        sys.NetMon.Get(),
 		HealthTracker: sys.HealthTracker(),
+		Metrics:       sys.UserMetricsRegistry(),
 		Dialer:        sys.Dialer.Get(),
 		SetSubsystem:  sys.Set,
 		ControlKnobs:  sys.ControlKnobs(),
 		DriveForLocal: driveimpl.NewFileSystemForLocal(logf),
 	}
+
+	sys.HealthTracker().SetMetricsRegistry(sys.UserMetricsRegistry())
 
 	onlyNetstack = name == "userspace-networking"
 	netstackSubnetRouter := onlyNetstack // but mutated later on some platforms
@@ -687,7 +708,7 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 			// configuration being unavailable (from the noop
 			// manager). More in Issue 4017.
 			// TODO(bradfitz): add a Synology-specific DNS manager.
-			conf.DNS, err = dns.NewOSConfigurator(logf, sys.HealthTracker(), "") // empty interface name
+			conf.DNS, err = dns.NewOSConfigurator(logf, sys.HealthTracker(), sys.ControlKnobs(), "") // empty interface name
 			if err != nil {
 				return false, fmt.Errorf("dns.NewOSConfigurator: %w", err)
 			}
@@ -715,7 +736,7 @@ func tryEngine(logf logger.Logf, sys *tsd.System, name string) (onlyNetstack boo
 			return false, fmt.Errorf("creating router: %w", err)
 		}
 
-		d, err := dns.NewOSConfigurator(logf, sys.HealthTracker(), devName)
+		d, err := dns.NewOSConfigurator(logf, sys.HealthTracker(), sys.ControlKnobs(), devName)
 		if err != nil {
 			dev.Close()
 			r.Close()
@@ -767,7 +788,6 @@ func runDebugServer(mux *http.ServeMux, addr string) {
 }
 
 func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
-	tfs, _ := sys.DriveForLocal.GetOK()
 	ret, err := netstack.Create(logf,
 		sys.Tun.Get(),
 		sys.Engine.Get(),
@@ -775,7 +795,6 @@ func newNetstack(logf logger.Logf, sys *tsd.System) (*netstack.Impl, error) {
 		sys.Dialer.Get(),
 		sys.DNSManager.Get(),
 		sys.ProxyMapper(),
-		tfs,
 	)
 	if err != nil {
 		return nil, err
@@ -883,4 +902,25 @@ func dieOnPipeReadErrorOfFD(fd int) {
 	f := os.NewFile(uintptr(fd), "TS_PARENT_DEATH_FD")
 	f.Read(make([]byte, 1))
 	os.Exit(1)
+}
+
+// applyIntegrationTestEnvKnob applies the tailscaled.env=... environment
+// variables specified on the Linux kernel command line, if the VM is being
+// run in NATLab integration tests.
+//
+// They're specified as: tailscaled.env=FOO=bar tailscaled.env=BAR=baz
+func applyIntegrationTestEnvKnob() {
+	if runtime.GOOS != "linux" || !hostinfo.IsNATLabGuestVM() {
+		return
+	}
+	cmdLine, _ := os.ReadFile("/proc/cmdline")
+	for _, s := range strings.Fields(string(cmdLine)) {
+		suf, ok := strings.CutPrefix(s, "tailscaled.env=")
+		if !ok {
+			continue
+		}
+		if k, v, ok := strings.Cut(suf, "="); ok {
+			envknob.Setenv(k, v)
+		}
+	}
 }

@@ -14,7 +14,7 @@ import (
 	"io"
 	"log"
 	"maps"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -26,7 +26,7 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
-	"tailscale.com/control/controlhttp"
+	"tailscale.com/control/controlhttp/controlhttpserver"
 	"tailscale.com/net/netaddr"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
@@ -288,7 +288,7 @@ func (s *Server) serveNoiseUpgrade(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	noisePrivate := s.noisePrivKey
 	s.mu.Unlock()
-	cc, err := controlhttp.AcceptHTTP(ctx, w, r, noisePrivate, nil)
+	cc, err := controlhttpserver.AcceptHTTP(ctx, w, r, noisePrivate, nil)
 	if err != nil {
 		log.Printf("AcceptHTTP: %v", err)
 		return
@@ -366,6 +366,7 @@ func (s *Server) serveMachine(w http.ResponseWriter, r *http.Request) {
 func (s *Server) SetSubnetRoutes(nodeKey key.NodePublic, routes []netip.Prefix) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.logf("Setting subnet routes for %s: %v", nodeKey.ShortString(), routes)
 	mak.Set(&s.nodeSubnetRoutes, nodeKey, routes)
 }
 
@@ -774,7 +775,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 		go panic(fmt.Sprintf("bad map request: %v", err))
 	}
 
-	jitter := time.Duration(rand.Intn(8000)) * time.Millisecond
+	jitter := rand.N(8 * time.Second)
 	keepAlive := 50*time.Second + jitter
 
 	node := s.Node(req.NodeKey)
@@ -831,7 +832,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 	w.WriteHeader(200)
 	for {
 		if resBytes, ok := s.takeRawMapMessage(req.NodeKey); ok {
-			if err := s.sendMapMsg(w, mkey, compress, resBytes); err != nil {
+			if err := s.sendMapMsg(w, compress, resBytes); err != nil {
 				s.logf("sendMapMsg of raw message: %v", err)
 				return
 			}
@@ -863,7 +864,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 				s.logf("json.Marshal: %v", err)
 				return
 			}
-			if err := s.sendMapMsg(w, mkey, compress, resBytes); err != nil {
+			if err := s.sendMapMsg(w, compress, resBytes); err != nil {
 				return
 			}
 		}
@@ -894,7 +895,7 @@ func (s *Server) serveMap(w http.ResponseWriter, r *http.Request, mkey key.Machi
 				}
 				break keepAliveLoop
 			case <-keepAliveTimerCh:
-				if err := s.sendMapMsg(w, mkey, compress, keepAliveMsg); err != nil {
+				if err := s.sendMapMsg(w, compress, keepAliveMsg); err != nil {
 					return
 				}
 			}
@@ -1018,6 +1019,7 @@ func (s *Server) MapResponse(req *tailcfg.MapRequest) (res *tailcfg.MapResponse,
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	res.Node.PrimaryRoutes = s.nodeSubnetRoutes[nk]
 	res.Node.AllowedIPs = append(res.Node.Addresses, s.nodeSubnetRoutes[nk]...)
 
 	// Consume a PingRequest while protected by mutex if it exists
@@ -1058,7 +1060,7 @@ func (s *Server) takeRawMapMessage(nk key.NodePublic) (mapResJSON []byte, ok boo
 	return mapResJSON, true
 }
 
-func (s *Server) sendMapMsg(w http.ResponseWriter, mkey key.MachinePublic, compress bool, msg any) error {
+func (s *Server) sendMapMsg(w http.ResponseWriter, compress bool, msg any) error {
 	resBytes, err := s.encode(compress, msg)
 	if err != nil {
 		return err

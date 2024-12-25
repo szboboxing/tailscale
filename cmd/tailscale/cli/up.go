@@ -32,10 +32,12 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/netutil"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/safesocket"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/preftype"
+	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/version"
 	"tailscale.com/version/distro"
@@ -104,7 +106,7 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 	upf.StringVar(&upArgs.server, "login-server", ipn.DefaultControlURL, "base URL of control server")
 	upf.BoolVar(&upArgs.acceptRoutes, "accept-routes", acceptRouteDefault(goos), "accept routes advertised by other Tailscale nodes")
 	upf.BoolVar(&upArgs.acceptDNS, "accept-dns", true, "accept DNS configuration from the admin panel")
-	upf.BoolVar(&upArgs.singleRoutes, "host-routes", true, hidden+"install host routes to other Tailscale nodes")
+	upf.Var(notFalseVar{}, "host-routes", hidden+"install host routes to other Tailscale nodes (must be true as of Tailscale 1.67+)")
 	upf.StringVar(&upArgs.exitNodeIP, "exit-node", "", "Tailscale exit node (IP or base name) for internet traffic, or empty string to not use an exit node")
 	upf.BoolVar(&upArgs.exitNodeAllowLANAccess, "exit-node-allow-lan-access", false, "Allow direct access to the local network when routing traffic via an exit node")
 	upf.BoolVar(&upArgs.shieldsUp, "shields-up", false, "don't allow incoming connections")
@@ -121,7 +123,7 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 	switch goos {
 	case "linux":
 		upf.BoolVar(&upArgs.snat, "snat-subnet-routes", true, "source NAT traffic to local routes advertised with --advertise-routes")
-		upf.BoolVar(&upArgs.statefulFiltering, "stateful-filtering", true, "apply stateful filtering to forwarded packets (subnet routers, exit nodes, etc.)")
+		upf.BoolVar(&upArgs.statefulFiltering, "stateful-filtering", false, "apply stateful filtering to forwarded packets (subnet routers, exit nodes, etc.)")
 		upf.StringVar(&upArgs.netfilterMode, "netfilter-mode", defaultNetfilterMode(), "netfilter mode (one of on, nodivert, off)")
 	case "windows":
 		upf.BoolVar(&upArgs.forceDaemon, "unattended", false, "run in \"Unattended Mode\" where Tailscale keeps running even after the current GUI user logs out (Windows-only)")
@@ -143,6 +145,18 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 	return upf
 }
 
+// notFalseVar is is a flag.Value that can only be "true", if set.
+type notFalseVar struct{}
+
+func (notFalseVar) IsBoolFlag() bool { return true }
+func (notFalseVar) Set(v string) error {
+	if v != "true" {
+		return fmt.Errorf("unsupported value; only 'true' is allowed")
+	}
+	return nil
+}
+func (notFalseVar) String() string { return "true" }
+
 func defaultNetfilterMode() string {
 	if distro.Get() == distro.Synology {
 		return "off"
@@ -150,13 +164,15 @@ func defaultNetfilterMode() string {
 	return "on"
 }
 
+// upArgsT is the type of upArgs, the argument struct for `tailscale up`.
+// As of 2024-10-08, upArgsT is frozen and no new arguments should be
+// added to it. Add new arguments to setArgsT instead.
 type upArgsT struct {
 	qr                     bool
 	reset                  bool
 	server                 string
 	acceptRoutes           bool
 	acceptDNS              bool
-	singleRoutes           bool
 	exitNodeIP             string
 	exitNodeAllowLANAccess bool
 	shieldsUp              bool
@@ -278,7 +294,6 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 
 	prefs.ExitNodeAllowLANAccess = upArgs.exitNodeAllowLANAccess
 	prefs.CorpDNS = upArgs.acceptDNS
-	prefs.AllowSingleHosts = upArgs.singleRoutes
 	prefs.ShieldsUp = upArgs.shieldsUp
 	prefs.RunSSH = upArgs.runSSH
 	prefs.RunWebClient = upArgs.runWebClient
@@ -295,23 +310,40 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 
 		// Backfills for NoStatefulFiltering occur when loading a profile; just set it explicitly here.
 		prefs.NoStatefulFiltering.Set(!upArgs.statefulFiltering)
-
-		switch upArgs.netfilterMode {
-		case "on":
-			prefs.NetfilterMode = preftype.NetfilterOn
-		case "nodivert":
-			prefs.NetfilterMode = preftype.NetfilterNoDivert
-			warnf("netfilter=nodivert; add iptables calls to ts-* chains manually.")
-		case "off":
-			prefs.NetfilterMode = preftype.NetfilterOff
-			if defaultNetfilterMode() != "off" {
-				warnf("netfilter=off; configure iptables yourself.")
-			}
-		default:
-			return nil, fmt.Errorf("invalid value --netfilter-mode=%q", upArgs.netfilterMode)
+		v, warning, err := netfilterModeFromFlag(upArgs.netfilterMode)
+		if err != nil {
+			return nil, err
+		}
+		prefs.NetfilterMode = v
+		if warning != "" {
+			warnf(warning)
 		}
 	}
 	return prefs, nil
+}
+
+// netfilterModeFromFlag returns the preftype.NetfilterMode for the provided
+// flag value. It returns a warning if there is something the user should know
+// about the value.
+func netfilterModeFromFlag(v string) (_ preftype.NetfilterMode, warning string, _ error) {
+	switch v {
+	case "on", "nodivert", "off":
+	default:
+		return preftype.NetfilterOn, "", fmt.Errorf("invalid value --netfilter-mode=%q", v)
+	}
+	m, err := preftype.ParseNetfilterMode(v)
+	if err != nil {
+		return preftype.NetfilterOn, "", err
+	}
+	switch m {
+	case preftype.NetfilterNoDivert:
+		warning = "netfilter=nodivert; add iptables calls to ts-* chains manually."
+	case preftype.NetfilterOff:
+		if defaultNetfilterMode() != "off" {
+			warning = "netfilter=off; configure iptables yourself."
+		}
+	}
+	return m, warning, nil
 }
 
 // updatePrefs returns how to edit preferences based on the
@@ -345,6 +377,12 @@ func updatePrefs(prefs, curPrefs *ipn.Prefs, env upCheckEnv) (simpleUp bool, jus
 	wantSSH, haveSSH := env.upArgs.runSSH, curPrefs.RunSSH
 	if err := presentSSHToggleRisk(wantSSH, haveSSH, env.upArgs.acceptedRisks); err != nil {
 		return false, nil, err
+	}
+
+	if runtime.GOOS == "darwin" && env.upArgs.advertiseConnector {
+		if err := presentRiskToUser(riskMacAppConnector, riskMacAppConnectorMessage, env.upArgs.acceptedRisks); err != nil {
+			return false, nil, err
+		}
 	}
 
 	if env.upArgs.forceReauth && isSSHOverTailscale() {
@@ -723,7 +761,6 @@ func init() {
 	addPrefFlagMapping("accept-dns", "CorpDNS")
 	addPrefFlagMapping("accept-routes", "RouteAll")
 	addPrefFlagMapping("advertise-tags", "AdvertiseTags")
-	addPrefFlagMapping("host-routes", "AllowSingleHosts")
 	addPrefFlagMapping("hostname", "Hostname")
 	addPrefFlagMapping("login-server", "ControlURL")
 	addPrefFlagMapping("netfilter-mode", "NetfilterMode")
@@ -762,7 +799,7 @@ func addPrefFlagMapping(flagName string, prefNames ...string) {
 // correspond to an ipn.Pref.
 func preflessFlag(flagName string) bool {
 	switch flagName {
-	case "auth-key", "force-reauth", "reset", "qr", "json", "timeout", "accept-risk":
+	case "auth-key", "force-reauth", "reset", "qr", "json", "timeout", "accept-risk", "host-routes":
 		return true
 	}
 	return false
@@ -859,11 +896,26 @@ func checkForAccidentalSettingReverts(newPrefs, curPrefs *ipn.Prefs, env upCheck
 			// Issue 6811. Ignore on Synology.
 			continue
 		}
+		if flagName == "stateful-filtering" && valCur == true && valNew == false && env.goos == "linux" {
+			// See https://github.com/tailscale/tailscale/issues/12307
+			// Stateful filtering was on by default in tailscale 1.66.0-1.66.3, then off in 1.66.4.
+			// This broke Tailscale installations in containerized
+			// environments that use the default containerboot
+			// configuration that configures tailscale using
+			// 'tailscale up' command, which requires that all
+			// previously set flags are explicitly provided on
+			// subsequent restarts.
+			continue
+		}
 		missing = append(missing, fmtFlagValueArg(flagName, valCur))
 	}
 	if len(missing) == 0 {
 		return nil
 	}
+
+	// Some previously provided flags are missing. This run of 'tailscale
+	// up' will error out.
+
 	sort.Strings(missing)
 
 	// Compute the stringification of the explicitly provided args in flagSet
@@ -958,8 +1010,6 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]any) {
 			set(prefs.ControlURL)
 		case "accept-routes":
 			set(prefs.RouteAll)
-		case "host-routes":
-			set(prefs.AllowSingleHosts)
 		case "accept-dns":
 			set(prefs.CorpDNS)
 		case "shields-up":
@@ -976,7 +1026,7 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]any) {
 			set(prefs.OperatorUser)
 		case "advertise-routes":
 			var sb strings.Builder
-			for i, r := range withoutExitNodes(prefs.AdvertiseRoutes) {
+			for i, r := range tsaddr.WithoutExitRoutes(views.SliceOf(prefs.AdvertiseRoutes)).All() {
 				if i > 0 {
 					sb.WriteByte(',')
 				}
@@ -984,7 +1034,7 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]any) {
 			}
 			set(sb.String())
 		case "advertise-exit-node":
-			set(hasExitNodeRoutes(prefs.AdvertiseRoutes))
+			set(tsaddr.ContainsExitRoutes(views.SliceOf(prefs.AdvertiseRoutes)))
 		case "advertise-connector":
 			set(prefs.AppConnector.Advertise)
 		case "snat-subnet-routes":
@@ -1016,36 +1066,6 @@ func fmtFlagValueArg(flagName string, val any) string {
 		return "--" + flagName + "="
 	}
 	return fmt.Sprintf("--%s=%v", flagName, shellquote.Join(fmt.Sprint(val)))
-}
-
-func hasExitNodeRoutes(rr []netip.Prefix) bool {
-	var v4, v6 bool
-	for _, r := range rr {
-		if r.Bits() == 0 {
-			if r.Addr().Is4() {
-				v4 = true
-			} else if r.Addr().Is6() {
-				v6 = true
-			}
-		}
-	}
-	return v4 && v6
-}
-
-// withoutExitNodes returns rr unchanged if it has only 1 or 0 /0
-// routes. If it has both IPv4 and IPv6 /0 routes, then it returns
-// a copy with all /0 routes removed.
-func withoutExitNodes(rr []netip.Prefix) []netip.Prefix {
-	if !hasExitNodeRoutes(rr) {
-		return rr
-	}
-	var out []netip.Prefix
-	for _, r := range rr {
-		if r.Bits() > 0 {
-			out = append(out, r)
-		}
-	}
-	return out
 }
 
 // exitNodeIP returns the exit node IP from p, using st to map
@@ -1137,10 +1157,10 @@ func resolveAuthKey(ctx context.Context, v, tags string) (string, error) {
 		ClientID:     "some-client-id", // ignored
 		ClientSecret: clientSecret,
 		TokenURL:     baseURL + "/api/v2/oauth/token",
-		Scopes:       []string{"device"},
 	}
 
 	tsClient := tailscale.NewClient("-", nil)
+	tsClient.UserAgent = "tailscale-cli"
 	tsClient.HTTPClient = credentials.Client(ctx)
 	tsClient.BaseURL = baseURL
 

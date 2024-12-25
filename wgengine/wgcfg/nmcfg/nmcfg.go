@@ -10,7 +10,6 @@ import (
 	"net/netip"
 	"strings"
 
-	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/logid"
@@ -41,8 +40,7 @@ func cidrIsSubnet(node tailcfg.NodeView, cidr netip.Prefix) bool {
 	if !cidr.IsSingleIP() {
 		return true
 	}
-	for i := range node.Addresses().Len() {
-		selfCIDR := node.Addresses().At(i)
+	for _, selfCIDR := range node.Addresses().All() {
 		if cidr == selfCIDR {
 			return false
 		}
@@ -111,8 +109,7 @@ func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, 
 		cpeer.V4MasqAddr = peer.SelfNodeV4MasqAddrForThisPeer()
 		cpeer.V6MasqAddr = peer.SelfNodeV6MasqAddrForThisPeer()
 		cpeer.IsJailed = peer.IsJailed()
-		for i := range peer.AllowedIPs().Len() {
-			allowedIP := peer.AllowedIPs().At(i)
+		for _, allowedIP := range peer.AllowedIPs().All() {
 			if allowedIP.Bits() == 0 && peer.StableID() != exitNode {
 				if didExitNodeWarn {
 					// Don't log about both the IPv4 /0 and IPv6 /0.
@@ -123,12 +120,6 @@ func WGCfg(nm *netmap.NetworkMap, logf logger.Logf, flags netmap.WGConfigFlags, 
 					skippedUnselected.WriteString(", ")
 				}
 				fmt.Fprintf(skippedUnselected, "%q (%v)", nodeDebugName(peer), peer.Key().ShortString())
-				continue
-			} else if allowedIP.IsSingleIP() && tsaddr.IsTailscaleIP(allowedIP.Addr()) && (flags&netmap.AllowSingleHosts) == 0 {
-				if skippedIPs.Len() > 0 {
-					skippedIPs.WriteString(", ")
-				}
-				fmt.Fprintf(skippedIPs, "%v from %q (%v)", allowedIP.Addr(), nodeDebugName(peer), peer.Key().ShortString())
 				continue
 			} else if cidrIsSubnet(peer, allowedIP) {
 				if (flags & netmap.AllowSubnetRoutes) == 0 {

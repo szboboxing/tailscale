@@ -23,6 +23,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"tailscale.com/ipn"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/types/opt"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/set"
@@ -46,12 +47,14 @@ type IngressReconciler struct {
 	// managedIngresses is a set of all ingress resources that we're currently
 	// managing. This is only used for metrics.
 	managedIngresses set.Slice[types.UID]
+
+	defaultProxyClass string
 }
 
 var (
 	// gaugeIngressResources tracks the number of ingress resources that we're
 	// currently managing.
-	gaugeIngressResources = clientmetric.NewGauge("k8s_ingress_resources")
+	gaugeIngressResources = clientmetric.NewGauge(kubetypes.MetricIngressResourceCount)
 )
 
 func (a *IngressReconciler) Reconcile(ctx context.Context, req reconcile.Request) (_ reconcile.Result, err error) {
@@ -73,7 +76,15 @@ func (a *IngressReconciler) Reconcile(ctx context.Context, req reconcile.Request
 		return reconcile.Result{}, a.maybeCleanup(ctx, logger, ing)
 	}
 
-	return reconcile.Result{}, a.maybeProvision(ctx, logger, ing)
+	if err := a.maybeProvision(ctx, logger, ing); err != nil {
+		if strings.Contains(err.Error(), optimisticLockErrorMsg) {
+			logger.Infof("optimistic lock error, retrying: %s", err)
+		} else {
+			return reconcile.Result{}, err
+		}
+	}
+
+	return reconcile.Result{}, nil
 }
 
 func (a *IngressReconciler) maybeCleanup(ctx context.Context, logger *zap.SugaredLogger, ing *networkingv1.Ingress) error {
@@ -87,7 +98,7 @@ func (a *IngressReconciler) maybeCleanup(ctx context.Context, logger *zap.Sugare
 		return nil
 	}
 
-	if done, err := a.ssr.Cleanup(ctx, logger, childResourceLabels(ing.Name, ing.Namespace, "ingress")); err != nil {
+	if done, err := a.ssr.Cleanup(ctx, logger, childResourceLabels(ing.Name, ing.Namespace, "ingress"), proxyTypeIngressResource); err != nil {
 		return fmt.Errorf("failed to cleanup: %w", err)
 	} else if !done {
 		logger.Debugf("cleanup not done yet, waiting for next reconcile")
@@ -133,7 +144,7 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		}
 	}
 
-	proxyClass := proxyClassForObject(ing)
+	proxyClass := proxyClassForObject(ing, a.defaultProxyClass)
 	if proxyClass != "" {
 		if ready, err := proxyClassIsReady(ctx, proxyClass, a.Client); err != nil {
 			return fmt.Errorf("error verifying ProxyClass for Ingress: %w", err)
@@ -264,7 +275,8 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		ServeConfig:         sc,
 		Tags:                tags,
 		ChildResourceLabels: crl,
-		ProxyClass:          proxyClass,
+		ProxyClassName:      proxyClass,
+		proxyType:           proxyTypeIngressResource,
 	}
 
 	if val := ing.GetAnnotations()[AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy]; val == "true" {
@@ -275,12 +287,12 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return fmt.Errorf("failed to provision: %w", err)
 	}
 
-	_, tsHost, _, err := a.ssr.DeviceInfo(ctx, crl)
+	dev, err := a.ssr.DeviceInfo(ctx, crl, logger)
 	if err != nil {
-		return fmt.Errorf("failed to get device ID: %w", err)
+		return fmt.Errorf("failed to retrieve Ingress HTTPS endpoint status: %w", err)
 	}
-	if tsHost == "" {
-		logger.Debugf("no Tailscale hostname known yet, waiting for proxy pod to finish auth")
+	if dev == nil || dev.ingressDNSName == "" {
+		logger.Debugf("no Ingress DNS name known yet, waiting for proxy Pod initialize and start serving Ingress")
 		// No hostname yet. Wait for the proxy pod to auth.
 		ing.Status.LoadBalancer.Ingress = nil
 		if err := a.Status().Update(ctx, ing); err != nil {
@@ -289,10 +301,10 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		return nil
 	}
 
-	logger.Debugf("setting ingress hostname to %q", tsHost)
+	logger.Debugf("setting Ingress hostname to %q", dev.ingressDNSName)
 	ing.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{
 		{
-			Hostname: tsHost,
+			Hostname: dev.ingressDNSName,
 			Ports: []networkingv1.IngressPortStatus{
 				{
 					Protocol: "TCP",

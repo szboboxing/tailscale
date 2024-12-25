@@ -167,7 +167,7 @@ func (s *FileSystemForRemote) buildChild(share *drive.Share) *compositedav.Child
 			return fmt.Sprintf("http://%s/%s/%s", hex.EncodeToString([]byte(share.Name)), secretToken, url.PathEscape(share.Name)), nil
 		},
 		Transport: &http.Transport{
-			Dial: func(_, shareAddr string) (net.Conn, error) {
+			DialContext: func(ctx context.Context, _, shareAddr string) (net.Conn, error) {
 				shareNameHex, _, err := net.SplitHostPort(shareAddr)
 				if err != nil {
 					return nil, fmt.Errorf("unable to parse share address %v: %w", shareAddr, err)
@@ -188,10 +188,11 @@ func (s *FileSystemForRemote) buildChild(share *drive.Share) *compositedav.Child
 				_, err = netip.ParseAddrPort(addr)
 				if err == nil {
 					// this is a regular network address, dial normally
-					return net.Dial("tcp", addr)
+					var std net.Dialer
+					return std.DialContext(ctx, "tcp", addr)
 				}
 				// assume this is a safesocket address
-				return safesocket.Connect(addr)
+				return safesocket.ConnectContext(ctx, addr)
 			},
 		},
 	}
@@ -332,11 +333,15 @@ func (s *userServer) run() error {
 		args = append(args, s.Name, s.Path)
 	}
 	var cmd *exec.Cmd
-	if s.canSudo() {
+	if su := s.canSU(); su != "" {
 		s.logf("starting taildrive file server as user %q", s.username)
-		allArgs := []string{"-n", "-u", s.username, s.executable}
-		allArgs = append(allArgs, args...)
-		cmd = exec.Command("sudo", allArgs...)
+		// Quote and escape arguments. Use single quotes to prevent shell substitutions.
+		for i, arg := range args {
+			args[i] = "'" + strings.ReplaceAll(arg, "'", "'\"'\"'") + "'"
+		}
+		cmdString := fmt.Sprintf("%s %s", s.executable, strings.Join(args, " "))
+		allArgs := []string{s.username, "-c", cmdString}
+		cmd = exec.Command(su, allArgs...)
 	} else {
 		// If we were root, we should have been able to sudo as a specific
 		// user, but let's check just to make sure, since we never want to
@@ -404,16 +409,28 @@ var writeMethods = map[string]bool{
 	"DELETE":    true,
 }
 
-// canSudo checks wether we can sudo -u the configured executable as the
-// configured user by attempting to call the executable with the '-h' flag to
-// print help.
-func (s *userServer) canSudo() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := exec.CommandContext(ctx, "sudo", "-n", "-u", s.username, s.executable, "-h").Run(); err != nil {
-		return false
+// canSU checks whether the current process can run su with the right username.
+// If su can be run, this returns the path to the su command.
+// If not, this returns the empty string "".
+func (s *userServer) canSU() string {
+	su, err := exec.LookPath("su")
+	if err != nil {
+		s.logf("can't find su command: %v", err)
+		return ""
 	}
-	return true
+
+	// First try to execute su <user> -c true to make sure we can su.
+	err = exec.Command(
+		su,
+		s.username,
+		"-c", "true",
+	).Run()
+	if err != nil {
+		s.logf("su check failed: %s", err)
+		return ""
+	}
+
+	return su
 }
 
 // assertNotRoot returns an error if the current user has UID 0 or if we cannot

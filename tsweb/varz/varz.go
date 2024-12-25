@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	_ "net/http/pprof"
 	"reflect"
 	"runtime"
 	"sort"
@@ -24,10 +23,16 @@ import (
 	"tailscale.com/version"
 )
 
+// StaticStringVar returns a new expvar.Var that always returns s.
+func StaticStringVar(s string) expvar.Var {
+	var v any = s // box s into an interface just once
+	return expvar.Func(func() any { return v })
+}
+
 func init() {
 	expvar.Publish("process_start_unix_time", expvar.Func(func() any { return timeStart.Unix() }))
-	expvar.Publish("version", expvar.Func(func() any { return version.Long() }))
-	expvar.Publish("go_version", expvar.Func(func() any { return runtime.Version() }))
+	expvar.Publish("version", StaticStringVar(version.Long()))
+	expvar.Publish("go_version", StaticStringVar(runtime.Version()))
 	expvar.Publish("counter_uptime_sec", expvar.Func(func() any { return int64(Uptime().Seconds()) }))
 	expvar.Publish("gauge_goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
 }
@@ -274,19 +279,28 @@ type sortedKVs struct {
 //
 // This will evolve over time, or perhaps be replaced.
 func Handler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain;version=0.0.4;charset=utf-8")
+	ExpvarDoHandler(expvarDo)(w, r)
+}
 
-	s := sortedKVsPool.Get().(*sortedKVs)
-	defer sortedKVsPool.Put(s)
-	s.kvs = s.kvs[:0]
-	expvarDo(func(kv expvar.KeyValue) {
-		s.kvs = append(s.kvs, sortedKV{kv, removeTypePrefixes(kv.Key)})
-	})
-	sort.Slice(s.kvs, func(i, j int) bool {
-		return s.kvs[i].sortKey < s.kvs[j].sortKey
-	})
-	for _, e := range s.kvs {
-		writePromExpVar(w, "", e.KeyValue)
+// ExpvarDoHandler handler returns a Handler like above, but takes an optional
+// expvar.Do func allow the usage of alternative containers of metrics, other
+// than the global expvar.Map.
+func ExpvarDoHandler(expvarDoFunc func(f func(expvar.KeyValue))) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain;version=0.0.4;charset=utf-8")
+
+		s := sortedKVsPool.Get().(*sortedKVs)
+		defer sortedKVsPool.Put(s)
+		s.kvs = s.kvs[:0]
+		expvarDoFunc(func(kv expvar.KeyValue) {
+			s.kvs = append(s.kvs, sortedKV{kv, removeTypePrefixes(kv.Key)})
+		})
+		sort.Slice(s.kvs, func(i, j int) bool {
+			return s.kvs[i].sortKey < s.kvs[j].sortKey
+		})
+		for _, e := range s.kvs {
+			writePromExpVar(w, "", e.KeyValue)
+		}
 	}
 }
 

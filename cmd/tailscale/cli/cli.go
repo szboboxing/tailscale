@@ -84,10 +84,22 @@ var localClient = tailscale.LocalClient{
 
 // Run runs the CLI. The args do not include the binary name.
 func Run(args []string) (err error) {
+	if runtime.GOOS == "linux" && os.Getenv("GOKRAZY_FIRST_START") == "1" && distro.Get() == distro.Gokrazy && os.Getppid() == 1 {
+		// We're running on gokrazy and it's the first start.
+		// Don't run the tailscale CLI as a service; just exit.
+		// See https://gokrazy.org/development/process-interface/
+		os.Exit(0)
+	}
+
 	args = CleanUpArgs(args)
 
-	if len(args) == 1 && (args[0] == "-V" || args[0] == "--version") {
-		args = []string{"version"}
+	if len(args) == 1 {
+		switch args[0] {
+		case "-V", "--version":
+			args = []string{"version"}
+		case "help":
+			args = []string{"--help"}
+		}
 	}
 
 	var warnOnce sync.Once
@@ -170,7 +182,7 @@ For help on subcommands, add --help after: "tailscale status --help".
 This CLI is still under active development. Commands and flags will
 change in the future.
 `),
-		Subcommands: []*ffcli.Command{
+		Subcommands: append([]*ffcli.Command{
 			upCmd,
 			downCmd,
 			setCmd,
@@ -178,9 +190,12 @@ change in the future.
 			logoutCmd,
 			switchCmd,
 			configureCmd,
+			syspolicyCmd,
 			netcheckCmd,
 			ipCmd,
+			dnsCmd,
 			statusCmd,
+			metricsCmd,
 			pingCmd,
 			ncCmd,
 			sshCmd,
@@ -199,7 +214,7 @@ change in the future.
 			debugCmd,
 			driveCmd,
 			idTokenCmd,
-		},
+		}, maybeAdvertiseCmd()...),
 		FlagSet: rootfs,
 		Exec: func(ctx context.Context, args []string) error {
 			if len(args) > 0 {

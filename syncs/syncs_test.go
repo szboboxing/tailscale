@@ -7,8 +7,8 @@ import (
 	"context"
 	"io"
 	"os"
-	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -63,6 +63,39 @@ func TestAtomicValue(t *testing.T) {
 		if got != nil || !gotOk {
 			t.Fatalf("LoadOk = (%v, %v), want (nil, true)", got, gotOk)
 		}
+	}
+}
+
+func TestMutexValue(t *testing.T) {
+	var v MutexValue[time.Time]
+	if n := int(testing.AllocsPerRun(1000, func() {
+		v.Store(v.Load())
+		v.WithLock(func(*time.Time) {})
+	})); n != 0 {
+		t.Errorf("AllocsPerRun = %d, want 0", n)
+	}
+
+	now := time.Now()
+	v.Store(now)
+	if !v.Load().Equal(now) {
+		t.Errorf("Load = %v, want %v", v.Load(), now)
+	}
+
+	var group WaitGroup
+	var v2 MutexValue[int]
+	var sum int
+	for i := range 10 {
+		group.Go(func() {
+			old1 := v2.Load()
+			old2 := v2.Swap(old1 + i)
+			delta := old2 - old1
+			v2.WithLock(func(p *int) { *p += delta })
+		})
+		sum += i
+	}
+	group.Wait()
+	if v2.Load() != sum {
+		t.Errorf("Load = %v, want %v", v2.Load(), sum)
 	}
 }
 
@@ -161,10 +194,9 @@ func TestMap(t *testing.T) {
 	}
 	got := map[string]int{}
 	want := map[string]int{"one": 1, "two": 2, "three": 3}
-	m.Range(func(k string, v int) bool {
+	for k, v := range m.All() {
 		got[k] = v
-		return true
-	})
+	}
 	if d := cmp.Diff(got, want); d != "" {
 		t.Errorf("Range mismatch (-got +want):\n%s", d)
 	}
@@ -179,29 +211,20 @@ func TestMap(t *testing.T) {
 	m.Delete("noexist")
 	got = map[string]int{}
 	want = map[string]int{}
-	m.Range(func(k string, v int) bool {
+	for k, v := range m.All() {
 		got[k] = v
-		return true
-	})
+	}
 	if d := cmp.Diff(got, want); d != "" {
 		t.Errorf("Range mismatch (-got +want):\n%s", d)
 	}
 
 	t.Run("LoadOrStore", func(t *testing.T) {
 		var m Map[string, string]
-		var wg sync.WaitGroup
-		wg.Add(2)
+		var wg WaitGroup
 		var ok1, ok2 bool
-		go func() {
-			defer wg.Done()
-			_, ok1 = m.LoadOrStore("", "")
-		}()
-		go func() {
-			defer wg.Done()
-			_, ok2 = m.LoadOrStore("", "")
-		}()
+		wg.Go(func() { _, ok1 = m.LoadOrStore("", "") })
+		wg.Go(func() { _, ok2 = m.LoadOrStore("", "") })
 		wg.Wait()
-
 		if ok1 == ok2 {
 			t.Errorf("exactly one LoadOrStore should load")
 		}

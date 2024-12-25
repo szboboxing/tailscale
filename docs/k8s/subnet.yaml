@@ -28,6 +28,13 @@ spec:
           optional: true
     - name: TS_ROUTES
       value: "{{TS_ROUTES}}"
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: POD_UID
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.uid
     securityContext:
-      runAsUser: 1000
-      runAsGroup: 1000
+      privileged: true

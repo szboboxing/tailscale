@@ -25,11 +25,14 @@ import (
 	"tailscale.com/health"
 	"tailscale.com/net/netmon"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/preftype"
 	"tailscale.com/util/linuxfw"
 	"tailscale.com/util/multierr"
 	"tailscale.com/version/distro"
 )
+
+var getDistroFunc = distro.Get
 
 const (
 	netfilterOff      = preftype.NetfilterOff
@@ -42,6 +45,7 @@ type linuxRouter struct {
 	logf              func(fmt string, args ...any)
 	tunname           string
 	netMon            *netmon.Monitor
+	health            *health.Tracker
 	unregNetMon       func()
 	addrs             map[netip.Prefix]bool
 	routes            map[netip.Prefix]bool
@@ -57,9 +61,9 @@ type linuxRouter struct {
 	ipRuleFixLimiter   *rate.Limiter
 
 	// Various feature checks for the network stack.
-	ipRuleAvailable bool // whether kernel was built with IP_MULTIPLE_TABLES
-	v6Available     bool // whether the kernel supports IPv6
-	fwmaskWorks     bool // whether we can use 'ip rule...fwmark <mark>/<mask>'
+	ipRuleAvailable bool     // whether kernel was built with IP_MULTIPLE_TABLES
+	v6Available     bool     // whether the kernel supports IPv6
+	fwmaskWorksLazy opt.Bool // whether we can use 'ip rule...fwmark <mark>/<mask>'; set lazily
 
 	// ipPolicyPrefBase is the base priority at which ip rules are installed.
 	ipPolicyPrefBase int
@@ -81,15 +85,16 @@ func newUserspaceRouter(logf logger.Logf, tunDev tun.Device, netMon *netmon.Moni
 		ambientCapNetAdmin: useAmbientCaps(),
 	}
 
-	return newUserspaceRouterAdvanced(logf, tunname, netMon, cmd)
+	return newUserspaceRouterAdvanced(logf, tunname, netMon, cmd, health)
 }
 
-func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon.Monitor, cmd commandRunner) (Router, error) {
+func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon.Monitor, cmd commandRunner, health *health.Tracker) (Router, error) {
 	r := &linuxRouter{
 		logf:          logf,
 		tunname:       tunname,
 		netfilterMode: netfilterOff,
 		netMon:        netMon,
+		health:        health,
 
 		cmd: cmd,
 
@@ -106,20 +111,6 @@ func newUserspaceRouterAdvanced(logf logger.Logf, tunname string, netMon *netmon
 			r.logf("[v1] policy routing available; found %d rules", len(rules))
 			r.ipRuleAvailable = true
 		}
-	}
-
-	// To be a good denizen of the 4-byte 'fwmark' bitspace on every packet, we try to
-	// only use the third byte. However, support for masking to part of the fwmark bitspace
-	// was only added to busybox in 1.33.0. As such, we want to detect older versions and
-	// not issue such a stanza.
-	var err error
-	if r.fwmaskWorks, err = ipCmdSupportsFwmask(); err != nil {
-		r.logf("failed to determine ip command fwmask support: %v", err)
-	}
-	if r.fwmaskWorks {
-		r.logf("[v1] ip command supports fwmark masks")
-	} else {
-		r.logf("[v1] ip command does NOT support fwmark masks")
 	}
 
 	// A common installation of OpenWRT involves use of the 'mwan3' package.
@@ -233,7 +224,7 @@ func busyboxParseVersion(output string) (major, minor, patch int, err error) {
 }
 
 func useAmbientCaps() bool {
-	if distro.Get() != distro.Synology {
+	if getDistroFunc() != distro.Synology {
 		return false
 	}
 	return distro.DSMVersion() >= 7
@@ -256,6 +247,31 @@ func (r *linuxRouter) useIPCommand() bool {
 	// command runner in tests.
 	_, ok := r.cmd.(osCommandRunner)
 	return !ok
+}
+
+// fwmaskWorks reports whether we can use 'ip rule...fwmark <mark>/<mask>'.
+// This is computed lazily on first use. By default, we don't run the "ip"
+// command, so never actually runs this. But the "ip" command is used in tests
+// and can be forced. (see useIPCommand)
+func (r *linuxRouter) fwmaskWorks() bool {
+	if v, ok := r.fwmaskWorksLazy.Get(); ok {
+		return v
+	}
+	// To be a good denizen of the 4-byte 'fwmark' bitspace on every packet, we try to
+	// only use the third byte. However, support for masking to part of the fwmark bitspace
+	// was only added to busybox in 1.33.0. As such, we want to detect older versions and
+	// not issue such a stanza.
+	v, err := ipCmdSupportsFwmask()
+	if err != nil {
+		r.logf("failed to determine ip command fwmask support: %v", err)
+	}
+	r.fwmaskWorksLazy.Set(v)
+	if v {
+		r.logf("[v1] ip command supports fwmark masks")
+	} else {
+		r.logf("[v1] ip command does NOT support fwmark masks")
+	}
+	return v
 }
 
 // onIPRuleDeleted is the callback from the network monitor for when an IP
@@ -420,14 +436,63 @@ func (r *linuxRouter) Set(cfg *Config) error {
 		}
 	}
 	r.statefulFiltering = cfg.StatefulFiltering
+	r.updateStatefulFilteringWithDockerWarning(cfg)
 
 	// Issue 11405: enable IP forwarding on gokrazy.
 	advertisingRoutes := len(cfg.SubnetRoutes) > 0
-	if distro.Get() == distro.Gokrazy && advertisingRoutes {
+	if getDistroFunc() == distro.Gokrazy && advertisingRoutes {
 		r.enableIPForwarding()
 	}
 
 	return multierr.New(errs...)
+}
+
+var dockerStatefulFilteringWarnable = health.Register(&health.Warnable{
+	Code:     "docker-stateful-filtering",
+	Title:    "Docker with stateful filtering",
+	Severity: health.SeverityMedium,
+	Text:     health.StaticMessage("Stateful filtering is enabled and Docker was detected; this may prevent Docker containers on this host from resolving DNS and connecting to Tailscale nodes. See https://tailscale.com/s/stateful-docker"),
+})
+
+func (r *linuxRouter) updateStatefulFilteringWithDockerWarning(cfg *Config) {
+	// If stateful filtering is disabled, clear the warning.
+	if !r.statefulFiltering {
+		r.health.SetHealthy(dockerStatefulFilteringWarnable)
+		return
+	}
+
+	advertisingRoutes := len(cfg.SubnetRoutes) > 0
+
+	// TODO(andrew-d,maisem): we might want to check if we're running in a
+	// container, since, if so, stateful filtering might prevent other
+	// containers from connecting through the Tailscale in this container.
+	//
+	// For now, just check for the case where we're running Tailscale on
+	// the host and Docker is also running.
+
+	// If this node isn't a subnet router or exit node, then we would never
+	// have allowed traffic from a Docker container in to Tailscale, since
+	// there wouldn't be an AllowedIP for the container's source IP. So we
+	// don't need to warn in this case.
+	//
+	// cfg.SubnetRoutes contains all subnet routes for the node, including
+	// the default route (0.0.0.0/0 or ::/0) if this node is an exit node.
+	if advertisingRoutes {
+		// Check for the presence of a Docker interface and warn if it's found
+		// on the system.
+		//
+		// TODO(andrew-d): do a better job at detecting Docker, e.g. by looking
+		// for it in the $PATH or by checking for the presence of the Docker
+		// socket/daemon/etc.
+		ifstate := r.netMon.InterfaceState()
+		if _, found := ifstate.Interface["docker0"]; found {
+			r.health.SetUnhealthy(dockerStatefulFilteringWarnable, nil)
+			return
+		}
+	}
+
+	// If we get here, then we have no warnings; clear anything existing.
+	r.health.SetHealthy(dockerStatefulFilteringWarnable)
 }
 
 // UpdateMagicsockPort implements the Router interface.
@@ -1118,7 +1183,9 @@ var (
 	tailscaleRouteTable = newRouteTable("tailscale", 52)
 )
 
-// ipRules are the policy routing rules that Tailscale uses.
+// baseIPRules are the policy routing rules that Tailscale uses, when not
+// running on a UDM-Pro.
+//
 // The priority is the value represented here added to r.ipPolicyPrefBase,
 // which is usually 5200.
 //
@@ -1133,7 +1200,7 @@ var (
 // and 'ip rule' implementations (including busybox), don't support
 // checking for the lack of a fwmark, only the presence. The technique
 // below works even on very old kernels.
-var ipRules = []netlink.Rule{
+var baseIPRules = []netlink.Rule{
 	// Packets from us, tagged with our fwmark, first try the kernel's
 	// main routing table.
 	{
@@ -1169,6 +1236,34 @@ var ipRules = []netlink.Rule{
 	// usual rules (pref 32766 and 32767, ie. main and default).
 }
 
+// udmProIPRules are the policy routing rules that Tailscale uses, when running
+// on a UDM-Pro.
+//
+// The priority is the value represented here added to
+// r.ipPolicyPrefBase, which is usually 5200.
+//
+// This represents an experiment that will be used to gather more information.
+// If this goes well, Tailscale may opt to use this for all of Linux.
+var udmProIPRules = []netlink.Rule{
+	// non-fwmark packets fall through to the usual rules (pref 32766 and 32767,
+	// ie. main and default).
+	{
+		Priority: 70,
+		Invert:   true,
+		Mark:     linuxfw.TailscaleBypassMarkNum,
+		Table:    tailscaleRouteTable.Num,
+	},
+}
+
+// ipRules returns the appropriate list of ip rules to be used by Tailscale. See
+// comments on baseIPRules and udmProIPRules for more details.
+func ipRules() []netlink.Rule {
+	if getDistroFunc() == distro.UDMPro {
+		return udmProIPRules
+	}
+	return baseIPRules
+}
+
 // justAddIPRules adds policy routing rule without deleting any first.
 func (r *linuxRouter) justAddIPRules() error {
 	if !r.ipRuleAvailable {
@@ -1180,7 +1275,7 @@ func (r *linuxRouter) justAddIPRules() error {
 	var errAcc error
 	for _, family := range r.addrFamilies() {
 
-		for _, ru := range ipRules {
+		for _, ru := range ipRules() {
 			// Note: r is a value type here; safe to mutate it.
 			ru.Family = family.netlinkInt()
 			if ru.Mark != 0 {
@@ -1209,14 +1304,14 @@ func (r *linuxRouter) addIPRulesWithIPCommand() error {
 	rg := newRunGroup(nil, r.cmd)
 
 	for _, family := range r.addrFamilies() {
-		for _, rule := range ipRules {
+		for _, rule := range ipRules() {
 			args := []string{
 				"ip", family.dashArg(),
 				"rule", "add",
 				"pref", strconv.Itoa(rule.Priority + r.ipPolicyPrefBase),
 			}
 			if rule.Mark != 0 {
-				if r.fwmaskWorks {
+				if r.fwmaskWorks() {
 					args = append(args, "fwmark", fmt.Sprintf("0x%x/%s", rule.Mark, linuxfw.TailscaleFwmarkMask))
 				} else {
 					args = append(args, "fwmark", fmt.Sprintf("0x%x", rule.Mark))
@@ -1257,7 +1352,7 @@ func (r *linuxRouter) delIPRules() error {
 	}
 	var errAcc error
 	for _, family := range r.addrFamilies() {
-		for _, ru := range ipRules {
+		for _, ru := range ipRules() {
 			// Note: r is a value type here; safe to mutate it.
 			// When deleting rules, we want to be a bit specific (mention which
 			// table we were routing to) but not *too* specific (fwmarks, etc).
@@ -1300,7 +1395,7 @@ func (r *linuxRouter) delIPRulesWithIPCommand() error {
 		// That leaves us some flexibility to change these values in later
 		// versions without having ongoing hacks for every possible
 		// combination.
-		for _, rule := range ipRules {
+		for _, rule := range ipRules() {
 			args := []string{
 				"ip", family.dashArg(),
 				"rule", "del",
@@ -1437,7 +1532,7 @@ func normalizeCIDR(cidr netip.Prefix) string {
 // platformCanNetfilter reports whether the current distro/environment supports
 // running iptables/nftables commands.
 func platformCanNetfilter() bool {
-	switch distro.Get() {
+	switch getDistroFunc() {
 	case distro.Synology:
 		// Synology doesn't support iptables or nftables. Attempting to run it
 		// just blocks for a long time while it logs about failures.
@@ -1463,7 +1558,7 @@ func cleanUp(logf logger.Logf, interfaceName string) {
 // of the config file being present as well as a policy rule with a specific
 // priority (2000 + 1 - first interface mwan3 manages) and non-zero mark.
 func checkOpenWRTUsingMWAN3() (bool, error) {
-	if distro.Get() != distro.OpenWrt {
+	if getDistroFunc() != distro.OpenWrt {
 		return false, nil
 	}
 

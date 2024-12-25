@@ -11,14 +11,15 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"sync"
 	"testing"
 	"time"
 
 	"tailscale.com/derp"
 	"tailscale.com/net/netmon"
+	"tailscale.com/tstest/deptest"
 	"tailscale.com/types/key"
+	"tailscale.com/util/set"
 )
 
 func TestSendRecv(t *testing.T) {
@@ -299,13 +300,13 @@ func TestBreakWatcherConnRecv(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		var peers int
-		add := func(k key.NodePublic, _ netip.AddrPort) {
-			t.Logf("add: %v", k.ShortString())
+		add := func(m derp.PeerPresentMessage) {
+			t.Logf("add: %v", m.Key.ShortString())
 			peers++
 			// Signal that the watcher has run
 			watcherChan <- peers
 		}
-		remove := func(k key.NodePublic) { t.Logf("remove: %v", k.ShortString()); peers-- }
+		remove := func(m derp.PeerGoneMessage) { t.Logf("remove: %v", m.Peer.ShortString()); peers-- }
 
 		watcher1.RunWatchConnectionLoop(ctx, serverPrivateKey1.Public(), t.Logf, add, remove)
 	}()
@@ -370,15 +371,15 @@ func TestBreakWatcherConn(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		var peers int
-		add := func(k key.NodePublic, _ netip.AddrPort) {
-			t.Logf("add: %v", k.ShortString())
+		add := func(m derp.PeerPresentMessage) {
+			t.Logf("add: %v", m.Key.ShortString())
 			peers++
 			// Signal that the watcher has run
 			watcherChan <- peers
 			// Wait for breaker to run
 			<-breakerChan
 		}
-		remove := func(k key.NodePublic) { t.Logf("remove: %v", k.ShortString()); peers-- }
+		remove := func(m derp.PeerGoneMessage) { t.Logf("remove: %v", m.Peer.ShortString()); peers-- }
 
 		watcher1.RunWatchConnectionLoop(ctx, serverPrivateKey1.Public(), t.Logf, add, remove)
 	}()
@@ -407,8 +408,8 @@ func TestBreakWatcherConn(t *testing.T) {
 	}
 }
 
-func noopAdd(key.NodePublic, netip.AddrPort) {}
-func noopRemove(key.NodePublic)              {}
+func noopAdd(derp.PeerPresentMessage) {}
+func noopRemove(derp.PeerGoneMessage) {}
 
 func TestRunWatchConnectionLoopServeConnect(t *testing.T) {
 	defer func() { testHookWatchLookConnectResult = nil }()
@@ -485,4 +486,24 @@ func TestProbe(t *testing.T) {
 			t.Errorf("for path %q got HTTP status %v; want %v", tt.path, got, tt.want)
 		}
 	}
+}
+
+func TestDeps(t *testing.T) {
+	deptest.DepChecker{
+		GOOS:   "darwin",
+		GOARCH: "arm64",
+		BadDeps: map[string]string{
+			"github.com/coder/websocket": "shouldn't link websockets except on js/wasm",
+		},
+	}.Check(t)
+
+	deptest.DepChecker{
+		GOOS:   "darwin",
+		GOARCH: "arm64",
+		Tags:   "ts_debug_websockets",
+		WantDeps: set.Of(
+			"github.com/coder/websocket",
+		),
+	}.Check(t)
+
 }

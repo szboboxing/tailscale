@@ -9,10 +9,13 @@ import (
 	"reflect"
 	"slices"
 	"testing"
+	"time"
 
 	xmaps "golang.org/x/exp/maps"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/appc/appctest"
+	"tailscale.com/tstest"
+	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
 	"tailscale.com/util/must"
 )
@@ -519,4 +522,83 @@ func TestRoutesWithout(t *testing.T) {
 	assert("no overlap", routesWithout(prefixes("1.1.1.1/32", "1.1.1.2/32"), prefixes("1.1.1.3/32", "1.1.1.4/32")), prefixes("1.1.1.1/32", "1.1.1.2/32"))
 	assert("a has fewer", routesWithout(prefixes("1.1.1.1/32", "1.1.1.2/32"), prefixes("1.1.1.1/32", "1.1.1.2/32", "1.1.1.3/32", "1.1.1.4/32")), []netip.Prefix{})
 	assert("a has more", routesWithout(prefixes("1.1.1.1/32", "1.1.1.2/32", "1.1.1.3/32", "1.1.1.4/32"), prefixes("1.1.1.1/32", "1.1.1.3/32")), prefixes("1.1.1.2/32", "1.1.1.4/32"))
+}
+
+func TestRateLogger(t *testing.T) {
+	clock := tstest.Clock{}
+	wasCalled := false
+	rl := newRateLogger(func() time.Time { return clock.Now() }, 1*time.Second, func(count int64, _ time.Time, _ int64) {
+		if count != 3 {
+			t.Fatalf("count for prev period: got %d, want 3", count)
+		}
+		wasCalled = true
+	})
+
+	for i := 0; i < 3; i++ {
+		clock.Advance(1 * time.Millisecond)
+		rl.update(0)
+		if wasCalled {
+			t.Fatalf("wasCalled: got true, want false")
+		}
+	}
+
+	clock.Advance(1 * time.Second)
+	rl.update(0)
+	if !wasCalled {
+		t.Fatalf("wasCalled: got false, want true")
+	}
+
+	wasCalled = false
+	rl = newRateLogger(func() time.Time { return clock.Now() }, 1*time.Hour, func(count int64, _ time.Time, _ int64) {
+		if count != 3 {
+			t.Fatalf("count for prev period: got %d, want 3", count)
+		}
+		wasCalled = true
+	})
+
+	for i := 0; i < 3; i++ {
+		clock.Advance(1 * time.Minute)
+		rl.update(0)
+		if wasCalled {
+			t.Fatalf("wasCalled: got true, want false")
+		}
+	}
+
+	clock.Advance(1 * time.Hour)
+	rl.update(0)
+	if !wasCalled {
+		t.Fatalf("wasCalled: got false, want true")
+	}
+}
+
+func TestRouteStoreMetrics(t *testing.T) {
+	metricStoreRoutes(1, 1)
+	metricStoreRoutes(1, 1)         // the 1 buckets value should be 2
+	metricStoreRoutes(5, 5)         // the 5 buckets value should be 1
+	metricStoreRoutes(6, 6)         // the 10 buckets value should be 1
+	metricStoreRoutes(10001, 10001) // the over buckets value should be 1
+	wanted := map[string]int64{
+		"appc_store_routes_n_routes_1":    2,
+		"appc_store_routes_rate_1":        2,
+		"appc_store_routes_n_routes_5":    1,
+		"appc_store_routes_rate_5":        1,
+		"appc_store_routes_n_routes_10":   1,
+		"appc_store_routes_rate_10":       1,
+		"appc_store_routes_n_routes_over": 1,
+		"appc_store_routes_rate_over":     1,
+	}
+	for _, x := range clientmetric.Metrics() {
+		if x.Value() != wanted[x.Name()] {
+			t.Errorf("%s: want: %d, got: %d", x.Name(), wanted[x.Name()], x.Value())
+		}
+	}
+}
+
+func TestMetricBucketsAreSorted(t *testing.T) {
+	if !slices.IsSorted(metricStoreRoutesRateBuckets) {
+		t.Errorf("metricStoreRoutesRateBuckets must be in order")
+	}
+	if !slices.IsSorted(metricStoreRoutesNBuckets) {
+		t.Errorf("metricStoreRoutesNBuckets must be in order")
+	}
 }
